@@ -40,7 +40,9 @@ use MOM_io, only : write_version_number, stdout_if_root
 use MOM_marine_ice, only : iceberg_forces, iceberg_fluxes, marine_ice_init, marine_ice_CS
 use MOM_string_functions, only : uppercase
 use MOM_surface_forcing_gfdl, only : surface_forcing_init, convert_IOB_to_fluxes
+use MOM_surface_forcing_gfdl, only : seaice_init
 use MOM_surface_forcing_gfdl, only : convert_IOB_to_forces, ice_ocn_bnd_type_chksum
+use MOM_surface_forcing_gfdl, only : extract_merged_ice_from_IOB, convert_merged_ice
 use MOM_surface_forcing_gfdl, only : ice_ocean_boundary_type, surface_forcing_CS
 use MOM_surface_forcing_gfdl, only : forcing_save_restart
 use MOM_time_manager, only : time_type, operator(>), operator(+), operator(-)
@@ -128,6 +130,8 @@ type, public ::  ocean_public_type
     calving => NULL(), &!< The mass per unit area of the ice shelf to convert to
                         !! bergs [kg m-2].
     calving_hflx => NULL() !< Calving heat flux [W m-2].
+  type(SIS_dyn_state_2d), pointer :: &
+    seaice => NULL()
   type(coupler_2d_bc_type) :: fields    !< A structure that may contain named
                                         !! arrays of tracer-related surface fields.
   integer                  :: avg_kount !< A count of contributions to running
@@ -185,6 +189,8 @@ type, public :: ocean_state_type ; private
                               !! steps can span multiple coupled time steps.
   logical :: diabatic_first   !< If true, apply diabatic and thermodynamic
                               !! processes before time stepping the dynamics.
+
+  logical :: use_dynmer_ice 
 
   type(directories) :: dirs   !< A structure containing several relevant directory paths.
   type(mech_forcing)          :: forces  !< A structure with the driving mechanical surface forces
@@ -324,6 +330,10 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
                  "If true, apply diabatic and thermodynamic processes, "//&
                  "including buoyancy forcing and mass gain or loss, "//&
                  "before stepping the dynamics forward.", default=.false.)
+  call get_param(param_file, mdl, "USE_DYN_MERGED_ICE", OS%use_dynmer_ice, &
+                 "If true, use a version of the split explicit time stepping scheme that "//&
+                 "also steps the merged sea ice state with the baroclinic steps of the "//&
+                 "ocean.", default=.false.)
 
   call get_param(param_file, mdl, "RESTART_CONTROL", OS%Restart_control, &
                  "An integer whose bits encode which restart files are "//&
@@ -387,6 +397,10 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
                               OS%forcing_CSp)
   endif
 
+  !if
+    call seaice_init(OS%grid, OS%seaice)
+  !endif
+
   if (OS%use_ice_shelf)  then
     call initialize_ice_shelf_fluxes(OS%ice_shelf_CSp, OS%grid, OS%US, OS%fluxes)
     call initialize_ice_shelf_forces(OS%ice_shelf_CSp, OS%grid, OS%US, OS%forces)
@@ -406,6 +420,7 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
 
   call initialize_ocean_public_type(OS%grid%Domain, Ocean_sfc, OS%diag, &
                                     gas_fields_ocn=gas_fields_ocn)
+  call seaice_init(OS%grid, Ocean_sfc%seaice)
 
   ! This call can only occur here if the coupler_bc_type variables have been
   ! initialized already using the information from gas_fields_ocn.
@@ -537,8 +552,8 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
     if (OS%icebergs_alter_ocean) &
       call iceberg_forces(OS%grid, OS%forces, OS%use_ice_shelf, &
                           OS%sfc_state, dt_coupling, OS%marine_ice_CSp)
-    if (OS%embedded_seaice) &
-      call extract_merged_ice_from_IOB(Ice_ocean_boundary, TJC) ! where will this be put?
+    if (OS%use_dynmer_ice) &
+      call extract_merged_ice_from_IOB(Ice_ocean_boundary, OS%seaice) ! where will this be put?
   endif
 
   if (do_thermo) then
@@ -691,6 +706,9 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
 !                                   OS%fluxes%p_surf_full, OS%press_to_z)
   call convert_state_to_ocean_type(OS%sfc_state, Ocean_sfc, OS%grid, OS%US)
   if (OS%calve_ice_shelf_bergs) call convert_shelf_state_to_ocean_type(Ocean_sfc,OS%Ice_shelf_CSp, OS%US)
+  if (OS%use_dynmer_ice) &
+    call convert_merged_ice(OS%seaice, Ocean_sfc%seaice) ! where will this be put?
+
   Time1 = OS%Time ; if (do_dyn) Time1 = OS%Time_dyn
   call coupler_type_send_data(Ocean_sfc%fields, Time1)
 

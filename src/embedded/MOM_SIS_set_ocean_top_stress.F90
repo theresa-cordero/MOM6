@@ -12,7 +12,7 @@ use MOM_SIS_hor_grid,  only : SIS_hor_grid_type
 use SIS_open_boundary, only : OBC_segment_type
 use SIS_open_boundary, only : ice_OBC_type, OBC_segment_type
 use SIS_types,         only : ice_ocean_flux_type, fast_ice_avg_type
-use ice_grid,          only : ice_grid_type
+use MOM_ice_grid,          only : ice_grid_type
 
 use MOM_SIS_dyn_types,     only : SIS_C_dyn_CS, SIS_dyn_state_2d, FIA_2d  
 
@@ -20,7 +20,7 @@ implicit none ; private
 
 #include <SIS2_memory.h>
 
-public :: set_ocean_top_stress_C2
+public :: set_ocean_top_stress_C2, set_wind_stresses_C
 
 contains
 !~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~!
@@ -179,5 +179,134 @@ subroutine set_ocean_top_stress_C2(IOF, windstr_x_water, windstr_y_water, &
   IOF%stress_count = IOF%stress_count + 1
 
 end subroutine set_ocean_top_stress_C2
+
+!~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~!
+!> set_wind_stresses_C determines the wind stresses on the ice and open ocean with
+!!   a C-grid staggering of the points.
+subroutine set_wind_stresses_C(FIA, ice_cover, ice_free, WindStr_x_Cu, WindStr_y_Cv, &
+                               WindStr_x_ocn_Cu, WindStr_y_ocn_Cv, G, US, max_ice_cover)
+  type(FIA_2d),           intent(in)   :: FIA !< A type containing averages of fields
+                                                         !! (mostly fluxes) over the fast updates
+  type(SIS_hor_grid_type),           intent(in)   :: G   !< The horizontal grid type
+  real, dimension(SZI_(G),SZJ_(G)),  intent(in)   :: &
+    ice_cover, &        !< The fractional ice coverage, summed across all
+                        !! thickness categories [nondim], between 0 & 1.
+    ice_free            !< The fractional open water [nondim], between 0 & 1.
+  real, dimension(SZIB_(G),SZJ_(G)), intent(out)  :: &
+    WindStr_x_Cu, &     !< Zonal wind stress averaged over the ice categories on C-grid u-points
+                        !! [R Z L T-2 ~> Pa].
+    WindStr_x_ocn_Cu    !< Zonal wind stress on the ice-free ocean on C-grid u-points [R Z L T-2 ~> Pa].
+  real, dimension(SZI_(G),SZJB_(G)), intent(out)  :: &
+    WindStr_y_Cv, &     !< Meridional wind stress averaged over the ice categories on C-grid v-points
+                        !! [R Z L T-2 ~> Pa].
+    WindStr_y_ocn_Cv    !< Meridional wind stress on the ice-free ocean on C-grid v-points [R Z L T-2 ~> Pa].
+  type(unit_scale_type),             intent(in)   :: US    !< A structure with unit conversion factors
+  real,                              intent(in)   :: max_ice_cover !< The fractional ice coverage
+                        !! that is close enough to 1 to be complete for the purpose of calculating
+                        !! wind stresses [nondim].
+!  type(ice_OBC_type),                pointer      :: OBC  !< Open boundary structure.
+
+  ! Local variables
+  real, dimension(SZI_(G),SZJ_(G))   :: &
+    WindStr_x_A, &      ! Zonal (_x_) and meridional (_y_) wind stresses
+    WindStr_y_A, &      ! averaged over the ice categories on an A-grid [R Z L T-2 ~> Pa].
+    WindStr_x_ocn_A, &  ! Zonal (_x_) and meridional (_y_) wind stresses on the
+    WindStr_y_ocn_A     ! ice-free ocean on an A-grid [R Z L T-2 ~> Pa].
+  real :: weights       ! A sum of the weights around a point.
+  real :: I_wts         ! 1.0 / wts or 0 if wts is 0 [nondim].
+  real :: FIA_ice_cover, ice_cover_now
+  integer :: i, j, isc, iec, jsc, jec
+  integer :: isd, ied, jsd, jed
+  logical :: local_open_u_BC, local_open_v_BC
+
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+
+!  local_open_u_BC = .false. ; local_open_v_BC = .false.
+!  if (associated(OBC)) then ; if (OBC%OBC_pe) then
+!    local_open_u_BC = OBC%open_u_BCs_exist_globally
+!    local_open_v_BC = OBC%open_v_BCs_exist_globally
+!  endif ; endif
+!
+!  if (local_open_u_BC .or. local_open_v_BC) &
+!      call SIS_error(FATAL, "No OBCs coded yet in set_wind_stresses_C")
+
+  !$OMP parallel do default(shared) private(FIA_ice_cover, ice_cover_now)
+  do j=jsd,jed ; do i=isd,ied
+    ! The use of these limits prevents the use of the ocean wind stresses if
+    ! there is actually no open ocean and hence there may be no valid ocean
+    ! stresses.  This can occur when ice_cover ~= 1 for both states, but
+    ! they are not exactly 1.0 due to roundoff in the sum across categories above.
+    ice_cover_now = min(ice_cover(i,j), max_ice_cover)
+    FIA_ice_cover = min(FIA%ice_cover(i,j), max_ice_cover)
+
+    if (ice_cover_now > FIA_ice_cover) then
+      WindStr_x_A(i,j) = ((ice_cover_now-FIA_ice_cover)*FIA%WindStr_ocn_x(i,j) + &
+                          FIA_ice_cover*FIA%WindStr_x(i,j)) / ice_cover_now
+      WindStr_y_A(i,j) = ((ice_cover_now-FIA_ice_cover)*FIA%WindStr_ocn_y(i,j) + &
+                          FIA_ice_cover*FIA%WindStr_y(i,j)) / ice_cover_now
+    else
+      WindStr_x_A(i,j) = FIA%WindStr_x(i,j)
+      WindStr_y_A(i,j) = FIA%WindStr_y(i,j)
+    endif
+
+    if (ice_free(i,j) <= FIA%ice_free(i,j)) then
+      WindStr_x_ocn_A(i,j) = FIA%WindStr_ocn_x(i,j)
+      WindStr_y_ocn_A(i,j) = FIA%WindStr_ocn_y(i,j)
+    else
+      WindStr_x_ocn_A(i,j) = ((ice_free(i,j)-FIA%ice_free(i,j))*FIA%WindStr_x(i,j) + &
+                              FIA%ice_free(i,j)*FIA%WindStr_ocn_x(i,j)) / ice_free(i,j)
+      WindStr_y_ocn_A(i,j) = ((ice_free(i,j)-FIA%ice_free(i,j))*FIA%WindStr_y(i,j) + &
+                              FIA%ice_free(i,j)*FIA%WindStr_ocn_y(i,j)) / ice_free(i,j)
+    endif
+  enddo ;  enddo
+
+  !   The j-loop extents here are larger than they would normally be in case
+  ! the stresses are being passed to the ocean on a B-grid.
+  !$OMP parallel default(shared) private(weights,I_wts)
+  !$OMP do
+  do j=jsc-1,jec+1 ; do I=isc-1,iec
+    weights = (G%areaT(i,j)*ice_cover(i,j) + G%areaT(i+1,j)*ice_cover(i+1,j))
+    if (G%mask2dCu(I,j) * weights > 0.0) then ; I_wts = 1.0 / weights
+      WindStr_x_Cu(I,j) = G%mask2dCu(I,j) * &
+          (G%areaT(i,j) * ice_cover(i,j) * WindStr_x_A(i,j) + &
+           G%areaT(i+1,j)*ice_cover(i+1,j)*WindStr_x_A(i+1,j)) * I_wts
+    else
+      WindStr_x_Cu(I,j) = 0.0
+    endif
+
+    weights = (G%areaT(i,j)*ice_free(i,j) + G%areaT(i+1,j)*ice_free(i+1,j))
+    if (G%mask2dCu(I,j) * weights > 0.0) then ; I_wts = 1.0 / weights
+      WindStr_x_ocn_Cu(I,j) = G%mask2dCu(I,j) * &
+          (G%areaT(i,j) * ice_free(i,j) * WindStr_x_ocn_A(i,j) + &
+           G%areaT(i+1,j)*ice_free(i+1,j)*WindStr_x_ocn_A(i+1,j)) * I_wts
+    else
+      WindStr_x_ocn_Cu(I,j) = 0.0
+    endif
+  enddo ; enddo
+  !$OMP end do nowait
+  !$OMP do
+  do J=jsc-1,jec ; do i=isc-1,iec+1
+    weights = (G%areaT(i,j)*ice_cover(i,j) + G%areaT(i,j+1)*ice_cover(i,j+1))
+    if (G%mask2dCv(i,J) * weights > 0.0) then ; I_wts = 1.0 / weights
+      WindStr_y_Cv(i,J) = G%mask2dCv(i,J) * &
+          (G%areaT(i,j) * ice_cover(i,j) * WindStr_y_A(i,j) + &
+           G%areaT(i,j+1)*ice_cover(i,j+1)*WindStr_y_A(i,j+1)) * I_wts
+    else
+      WindStr_y_Cv(i,J) = 0.0
+    endif
+
+    weights = (G%areaT(i,j)*ice_free(i,j) + G%areaT(i,j+1)*ice_free(i,j+1))
+    if (weights > 0.0) then ; I_wts = 1.0 / weights
+      WindStr_y_ocn_Cv(i,J) = G%mask2dCv(i,J) * &
+          (G%areaT(i,j) * ice_free(i,j) * WindStr_y_ocn_A(i,j) + &
+           G%areaT(i,j+1)*ice_free(i,j+1)*WindStr_y_ocn_A(i,j+1)) * I_wts
+    else
+      WindStr_y_ocn_Cv(i,J) = 0.0
+    endif
+  enddo ; enddo
+  !$OMP end parallel
+
+end subroutine set_wind_stresses_C
 
 end module MOM_SIS_set_ocean_top_stress 

@@ -4,7 +4,9 @@ module MOM_SIS_dyn_types
 use MOM_time_manager,  only : time_type
 use SIS_diag_mediator, only : SIS_diag_ctrl
 use MOM_SIS_hor_grid,  only : SIS_hor_grid_type
+use MOM_ice_grid,  only : ice_grid_type 
 use MOM_unit_scaling, only : unit_scale_type
+use MOM_SIS_continuity,  only : SIS_continuity_CS
 implicit none ; private
 
 #include <SIS2_memory.h>
@@ -40,14 +42,25 @@ type, public :: SIS_dyn_state_2d ; !private
                           !! transportation substep [R Z L2 T-1 ~> kg s-1].
 
   type(FIA_2d), pointer :: FIA_2d => NULL()
-  type(SIS_C_dyn_CS), pointer :: SIS_C_dyn_CS => NULL()
+  type(SIS_C_dyn_CS), pointer :: SIS_C_dyn_CSp => NULL()
+  type(dynmer_trans_CS), pointer :: dynmer_trans_CSp => NULL()
   type(SIS_hor_grid_type), pointer :: sG => NULL()
+  type(ice_grid_type), pointer :: IG => NULL()
   type(unit_scale_type), pointer :: US => NULL()
 
 end type SIS_dyn_state_2d
 
+type, public :: dynmer_trans_CS; !private
+  logical :: debug
+  logical :: do_ridging
+  type(SIS_diag_ctrl), pointer :: diag => NULL() !< A structure that is used to regulate the 
+  type(SIS_continuity_CS),    pointer :: continuity_CSp => NULL() 
+  type(SIS_continuity_CS),    pointer :: cover_trans_CSp => NULL()
+end type dynmer_trans_CS
+
 type, public :: FIA_2d ; !private
   real, allocatable, dimension(:,:) :: ice_cover
+  real, allocatable, dimension(:,:) :: ice_free
   real, allocatable, dimension(:,:) :: &
     WindStr_x ,&
     WindStr_y, &

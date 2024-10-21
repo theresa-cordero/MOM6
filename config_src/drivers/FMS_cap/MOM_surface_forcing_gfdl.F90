@@ -50,7 +50,8 @@ implicit none ; private
 #include <MOM_memory.h>
 
 public convert_IOB_to_fluxes, convert_IOB_to_forces
-public surface_forcing_init
+public extract_merged_ice_from_IOB, convert_merged_ice
+public surface_forcing_init, seaice_init
 public ice_ocn_bnd_type_chksum
 public forcing_save_restart
 
@@ -1162,6 +1163,45 @@ subroutine extract_IOB_stresses(IOB, index_bounds, Time, G, US, CS, taux, tauy, 
 
 end subroutine extract_IOB_stresses
 
+subroutine convert_merged_ice(seaice_in, seaice_out)
+  type(SIS_dyn_state_2d),  &
+                    intent(inout) :: seaice_in
+  type(SIS_dyn_state_2d),  &
+                    intent(inout) :: seaice_out
+  seaice_out = seaice_in 
+end subroutine
+
+subroutine extract_merged_ice_from_IOB(iob, seaice)
+  type(ice_ocean_boundary_type), &
+                    intent(in) :: iob   !< An ice-ocean boundary type with fluxes to drive the
+  type(SIS_dyn_state_2d),  &
+                    intent(inout) :: seaice
+
+  seaice = iob%IceDS2d
+  
+!  seaice%max_nts = iob%IceDS2d 
+!  seaice%nts = iob% 
+!  seaice%ridge_rate_count = iob% 
+!
+!  seaice%avg_ridge_rate(:,:) = iob% 
+!  seaice%mi_sum(:,:) = iob% 
+!  seaice%ice_cover(:,:) = iob% 
+!  seaice%u_ice_B(:,:) = iob% 
+!  seaice%v_ice_B(:,:) = iob% 
+!  seaice%u_ice_C(:,:) = iob% 
+!  seaice%v_ice_C(:,:) = iob% 
+!  seaice%mca_step(:,:,:) = iob%
+!  seaice%uh_step(:,:,:) = iob% 
+!  seaice%vh_step(:,:,:) = iob% 
+!
+!  seaice%FIA_2d = iob%
+!  seaice%SIS_C_dyn_CSp = iob%
+!  seaice%dynmer_trans_CSp = iob%
+!  seaice%sG = iob%
+!  seaice%IG = iob%
+!  seaice%US = iob%
+
+end subroutine 
 
 !> Adds thermodynamic flux adjustments obtained via data_override
 !! Component name is 'OCN'
@@ -1293,6 +1333,46 @@ subroutine forcing_save_restart(CS, G, Time, directory, time_stamped, &
   call save_restart(directory, Time, G, CS%restart_CSp, time_stamped)
 
 end subroutine forcing_save_restart
+
+!> Initialize the surface forcing, including setting parameters and allocating permanent memory.
+subroutine seaice_init(G, CS)
+  type(ocean_grid_type),    intent(in)    :: G    !< The ocean's grid structure
+  type(SIS_dyn_state_2d), pointer       :: CS   !< A pointer that is set to point to the control
+
+  ! Local variables
+  integer :: i, j, isd, ied, jsd, jed
+  integer :: isdB, iedB, jsdB, jedB
+
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  isdB = G%isdB ; iedB = G%iedB ; jsdB = G%jsdB ; jedB = G%jedB
+
+  !if dyn/merged ice
+    if (.not.associated(CS)) allocate(CS)
+    allocate( CS%mi_sum(isd:ied,jsd:jed) )
+    allocate( CS%ice_cover(isd:ied,jsd:jed))
+    allocate( CS%u_ice_C(IsdB:IedB,jsd:jed))
+    allocate( CS%v_ice_C(isd:ied,JsdB:JedB))
+    allocate( CS%uh_step(IsdB:IedB,jsd:jed,1)) ! !! third dim here needs to be number of seice timesteps??
+    allocate( CS%vh_step(isd:ied,JsdB:JedB,1)) !
+    allocate( CS%mca_step(isd:ied,jsd:jed,2))  ! 
+    ! only needed for embedded/semiembedded coupling
+    if (.not.associated(CS%FIA_2d)) allocate(CS%FIA_2d)
+    allocate( CS%FIA_2d%ice_cover(isd:ied,jsd:jed))
+    allocate( CS%FIA_2d%ice_free(isd:ied,jsd:jed))
+    allocate( CS%FIA_2d%WindStr_x(IsdB:IedB,jsd:jed))
+    allocate( CS%FIA_2d%WindStr_y(isd:ied,JsdB:JedB))
+    allocate( CS%FIA_2d%WindStr_ocn_x(IsdB:IedB,jsd:jed))
+    allocate( CS%FIA_2d%WindStr_ocn_y(isd:ied,JsdB:JedB))
+    if (.not.associated(CS%dynmer_trans_CSp)) allocate(CS%dynmer_trans_CSp)
+    if (.not.associated(CS%dynmer_trans_CSp%diag)) allocate(CS%dynmer_trans_CSp%diag)
+    if (.not.associated(CS%dynmer_trans_CSp%continuity_CSp)) allocate(CS%dynmer_trans_CSp%continuity_CSp )
+    if (.not.associated(CS%dynmer_trans_CSp%cover_trans_CSp)) allocate(CS%dynmer_trans_CSp%cover_trans_CSp)
+    if (.not.associated(CS%SIS_C_dyn_CSp)) allocate(CS%SIS_C_dyn_CSp)
+    if (.not.associated(CS%sG)) allocate(CS%sG)
+    if (.not.associated(CS%US)) allocate(CS%US)
+    if (.not.associated(CS%IG)) allocate(CS%IG)
+  !endif  
+end subroutine seaice_init
 
 !> Initialize the surface forcing, including setting parameters and allocating permanent memory.
 subroutine surface_forcing_init(Time, G, US, param_file, diag, CS, wind_stagger)

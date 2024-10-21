@@ -77,15 +77,17 @@ use MOM_wave_interface,        only : wave_parameters_CS, Stokes_PGF
 use MOM_SIS_dyn_types, only : SIS_dyn_state_2d
 use MOM_SIS_hor_grid,  only : SIS_hor_grid_type
 use MOM_SIS_dyn_cgrid, only : SIS_C_dynamics
-use MOM_SIS_set_ocean_top_stress, only:  set_ocean_top_stress_C2
-use MOM_SIS_continuity, only : summed_continuity
+use MOM_SIS_set_ocean_top_stress, only:  set_ocean_top_stress_C2, set_wind_stresses_C
+use MOM_SIS_continuity, only : summed_continuity, ice_cover_transport
+use MOM_ice_grid, only : ice_grid_type
+use MOM_domains,       only : fill_symmetric_edges
 
 implicit none ; private
 
 #include <MOM_memory.h>
 
 !> MOM_dynamics_split_RK2 module control structure
-type, public :: MOM_dyn_split_RK2_CS ; private
+type, public :: MOM_dyn_split_RK2e_CS ; private
   real ALLOCABLE_, dimension(NIMEMB_PTR_,NJMEM_,NKMEM_) :: &
     CAu, &    !< CAu = f*v - u.grad(u) [L T-2 ~> m s-2]
     CAu_pred, & !< The predictor step value of CAu = f*v - u.grad(u) [L T-2 ~> m s-2]
@@ -270,14 +272,14 @@ type, public :: MOM_dyn_split_RK2_CS ; private
   type(group_pass_type) :: pass_h  !< Structure for group halo pass
   type(group_pass_type) :: pass_av_uvh  !< Structure for group halo pass
 
-end type MOM_dyn_split_RK2_CS
+end type MOM_dyn_split_RK2e_CS
 
 
 public step_MOM_dyn_split_RK2e
-public register_restarts_dyn_split_RK2
-public initialize_dyn_split_RK2
-public remap_dyn_split_RK2_aux_vars
-public end_dyn_split_RK2
+public register_restarts_dyn_split_RK2e
+public initialize_dyn_split_RK2e
+public remap_dyn_split_RK2e_aux_vars
+public end_dyn_split_RK2e
 
 !>@{ CPU time clock IDs
 integer :: id_clock_Cor, id_clock_pres, id_clock_vertvisc
@@ -325,7 +327,7 @@ subroutine step_MOM_dyn_split_RK2e(u_inst, v_inst, h, tv, visc, Time_local, dt, 
                                                                    !! since last tracer advection [H L2 ~> m3 or kg]
   real, dimension(SZI_(G),SZJ_(G)),  intent(out)   :: eta_av       !< Free surface height or column mass
                                                                    !! averaged over time step [H ~> m or kg m-2]
-  type(MOM_dyn_split_RK2_CS),        pointer       :: CS           !< Module control structure
+  type(MOM_dyn_split_RK2e_CS),        pointer       :: CS           !< Module control structure
   logical,                           intent(in)    :: calc_dtbt    !< If true, recalculate the barotropic time step
   type(VarMix_CS),                   intent(inout) :: VarMix       !< Variable mixing control structure
   type(MEKE_type),                   intent(inout) :: MEKE         !< MEKE fields
@@ -922,7 +924,7 @@ subroutine step_MOM_dyn_split_RK2e(u_inst, v_inst, h, tv, visc, Time_local, dt, 
 
   !--- SEAICE STEP --- START ---!
   !--- advance sea ice state using the predictor ocean velocity
-  call seaice_step(seaice, G, seaice%sG, up(:,:,0), vp(:,:,0), eta_pred, dt_pred, taux_surf_pred, tauy_surf_pred)
+  call seaice_step(seaice, G, seaice%sG, up(:,:,1), vp(:,:,1), eta_pred, dt_pred, Time_local, taux_surf_pred, tauy_surf_pred)
   !call SIS_C_dynamics(ci, mis, mice, ui, vi, uo, vo, fxat, fyat, &
   !                        sea_lev, fxoc, fyoc, dt_slow, G, US, CS) 
   !--- SEAICE STEP ---  END  ---!
@@ -1062,7 +1064,7 @@ subroutine step_MOM_dyn_split_RK2e(u_inst, v_inst, h, tv, visc, Time_local, dt, 
 
   !--- SEAICE STEP --- START ---!
   !--- advance sea ice state using the corrector ocean velocity
-  call seaice_step(seaice,  G, seaice%sG, u_inst(:,:,0), v_inst(:,:,0), eta, dt, taux_surf_corr, tauy_surf_corr)
+  call seaice_step(seaice,  G, seaice%sG, u_inst(:,:,1), v_inst(:,:,1), eta, dt, Time_local, taux_surf_corr, tauy_surf_corr)
   ! taux and tauy from this call may not be used again..... they may not be the same as taux_init next time step. 
   !call SIS_C_dynamics(ci, mis, mice, ui, vi, uo, vo, fxat, fyat, &
   !                        sea_lev, fxoc, fyoc, dt_slow, G, US, CS) 
@@ -1224,7 +1226,7 @@ subroutine step_MOM_dyn_split_RK2e(u_inst, v_inst, h, tv, visc, Time_local, dt, 
 
 end subroutine step_MOM_dyn_split_RK2e
 
-subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, taux, tauy)
+subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, time_local, taux, tauy)
   type(SIS_dyn_state_2d), pointer       :: DS2d  !< the merged sea ice state
   type(SIS_hor_grid_type),  intent(inout)         :: sG   !< The horizontal grid type
   type(ocean_grid_type),  intent(inout)         :: G   !< The horizontal grid type
@@ -1236,6 +1238,7 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, taux, tauy)
                                                                ! or column mass [H ~> m or kg m-2]
   real,                              intent(in) :: dt_slow !< The amount of time over which the ice
                                                               !! dynamics are to be advanced [T ~> s].
+  type(time_type) :: Time_local
   real, dimension(SZIB_(G),SZJ_(G)),  intent(inout) :: taux ! surface stress 
   real, dimension(SZI_(G),SZJB_(G)),  intent(inout) :: tauy ! surface stress 
 
@@ -1257,6 +1260,7 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, taux, tauy)
   real, dimension(SZIB_(sG),SZJ_(sG))  :: fxoc  !< Zonal ice stress on ocean [R Z L T-2 ~> Pa]
   real, dimension(SZI_(sG),SZJB_(sG))  :: fyoc  !< Meridional ice stress on ocean [R Z L T-2 ~> Pa]
   type(unit_scale_type)              :: US    !< A structure with unit conversion factors
+  type(ice_grid_type)        :: IG   !< 
 
   real, dimension(SZIB_(sG),SZJ_(sG))  :: &
     WindStr_x_Cu, &   ! Zonal wind stress averaged over the ice categories on C-grid u-points [R Z L T-2 ~> Pa].
@@ -1270,14 +1274,27 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, taux, tauy)
   real :: flux_u, flux_v, ps_ocn, ps_ice 
   real, dimension(SZIB_(G),SZJ_(G)) :: taux_in_C ! surface stress 
   real, dimension(SZI_(G),SZJB_(G)) :: tauy_in_C ! surface stress 
+  real :: stress_conversion
+  integer :: halo
 
-  integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz
+  real :: dt_slow_dyn_sec  ! The slow dynamics timestep [s].
+
+  integer :: i, j, k, ncat, isc, iec, jsc, jec
   integer :: isd, jsd, ied, jed
+
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec ; ! ncat = sG%CatIce
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
   ! information passed from sea ice model to MOM6
   ice_cover = DS2d%ice_cover ; mis = DS2d%mi_sum ; mice = DS2d%mi_sum ;
   ui = DS2d%u_ice_C ; vi = DS2d%v_ice_C ;
-  sG  = DS2d%sG ; US = DS2d%US 
+  sG  = DS2d%sG ; US = DS2d%US; IG = DS2d%IG 
+
+  stress_conversion = US%Pa_to_RLZ_T2 ! * CS%wind_stress_multiplier
+  halo = 0 ! ; if (present(tau_halo)) halo = tau_halo
+
+  dt_slow_dyn_sec = US%T_to_s*dt_slow
+
 
   ! Are eta and sea level the same?
   ! Assuming yes for now, correction will go here if not.
@@ -1337,7 +1354,7 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, taux, tauy)
   ! Store all mechanical ocean forcing.
   !call set_ocean_top_stress_C2(IOF, WindStr_x_ocn_Cu, WindStr_y_ocn_Cv, &
   !                             str_x_ice_ocn_Cu, str_y_ice_ocn_Cv, ice_free, DS2d%ice_cover, G, US, OBC)
-  ! Update surface forcing fot the ocean 
+  ! Update surface forcing for the ocean 
   ! taux = ps_ocn*WindStr_x_ocn_Cu + ps_ice*str_x_ice_ocn_Cu
        taux_in_C(:,:) = 0.0 ; tauy_in_C(:,:) = 0.0
       do j=jsc,jec ; do I=Isc-1,iec
@@ -1346,7 +1363,7 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, taux, tauy)
           ps_ocn = 0.5*(ice_free(i+1,j) + ice_free(i,j))
           ps_ice = 0.5*(ice_cover(i+1,j) + ice_cover(i,j))
         endif
-        flux_u = (ps_ocn * windstr_x_water(I,j) + ps_ice * str_ice_oce_x(I,j))
+        flux_u = (ps_ocn * windstr_x_ocn_Cu(I,j) + ps_ice * str_x_ice_ocn_Cu(I,j))
         taux_in_C = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*flux_u*stress_conversion
       enddo ; enddo
       do J=jsc-1,jec ; do i=isc,iec
@@ -1355,7 +1372,7 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, taux, tauy)
           ps_ocn = 0.5*(ice_free(i,j+1) + ice_free(i,j))
           ps_ice = 0.5*(ice_cover(i,j+1) + ice_cover(i,j))
         endif
-        flux_v = (ps_ocn * windstr_y_water(i,J) + ps_ice * str_ice_oce_y(i,J))
+        flux_v = (ps_ocn * windstr_y_ocn_Cv(i,J) + ps_ice * str_y_ice_ocn_Cv(i,J))
         tauy_in_C(i,J) = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*flux_v*stress_conversion
       enddo ; enddo
          !if (IOF%slp2ocean) then  
@@ -1387,23 +1404,25 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, taux, tauy)
    ! endif
 
    ! if (CS%debug) call uvchksum("Before ice_transport [uv]_ice_C", DS2d%u_ice_C, DS2d%v_ice_C, sG, scale=US%L_T_to_m_s)
-    call enable_SIS_averaging(dt_slow_dyn_sec, Time_start + real_to_time(nds*dt_slow_dyn_sec), CS%diag)
+   !  call enable_SIS_averaging(dt_slow_dyn_sec, Time_local + real_to_time(nds*dt_slow_dyn_sec), CS%diag)
 
     ! Update the integrated ice mass and store the transports in each step.
-    if (DS2d%nts+CS%adv_substeps > DS2d%max_nts) &
-      call increase_max_tracer_step_memory(DS2d, sG, DS2d%nts+CS%adv_substeps)
+    !if (DS2d%nts+CS%adv_substeps > DS2d%max_nts) &
+    !  call increase_max_tracer_step_memory(DS2d, sG, DS2d%nts+CS%adv_substeps)
+    !if (DS2d%nts+1 > DS2d%max_nts) &
+    !  call increase_max_tracer_step_memory(DS2d, sG, DS2d%nts+1)
 
     !do n = DS2d%nts+1, DS2d%nts+CS%adv_substeps
     !  if ((n < ndyn_steps*CS%adv_substeps) .or. continuing_call) then
         ! Some of the work is not needed for the last step before cat_ice_transport.
-        call summed_continuity(DS2d%u_ice_C, DS2d%v_ice_C, DS2d%mca_step(:,:,n-1), DS2d%mca_step(:,:,n), &
-                               DS2d%uh_step(:,:,n), DS2d%vh_step(:,:,n), dt_adv, sG, US, IG, &
-                               CS%continuity_CSp, h_ice=DS2d%mi_sum)
-        call ice_cover_transport(DS2d%u_ice_C, DS2d%v_ice_C, DS2d%ice_cover, dt_adv, sG, US, IG, CS%cover_trans_CSp, &
-                                 masking_uhtot=DS2d%uh_step(:,:,n), masking_vhtot=DS2d%vh_step(:,:,n))
+        call summed_continuity(DS2d%u_ice_C, DS2d%v_ice_C, DS2d%mca_step(:,:,0), DS2d%mca_step(:,:,1), &
+                               DS2d%uh_step(:,:,1), DS2d%vh_step(:,:,1), dt_slow, sG, US, IG, &
+                               DS2d%dynmer_trans_CSp%continuity_CSp, h_ice=DS2d%mi_sum)
+        call ice_cover_transport(DS2d%u_ice_C, DS2d%v_ice_C, DS2d%ice_cover, dt_slow, sG, US, IG, DS2d%dynmer_trans_CSp%cover_trans_CSp, &
+                                 masking_uhtot=DS2d%uh_step(:,:,1), masking_vhtot=DS2d%vh_step(:,:,1))
         call pass_var(DS2d%mi_sum, sG%Domain, complete=.false.)
         call pass_var(DS2d%ice_cover, sG%Domain, complete=.false.)
-        call pass_var(DS2d%mca_step(:,:,n), sG%Domain, complete=.true.)
+        call pass_var(DS2d%mca_step(:,:,1), sG%Domain, complete=.true.)
     !  else
     !   call summed_continuity(DS2d%u_ice_C, DS2d%v_ice_C, DS2d%mca_step(:,:,n-1), DS2d%mca_step(:,:,n), &
     !                           DS2d%uh_step(:,:,n), DS2d%vh_step(:,:,n), dt_adv, sG, US, IG, CS%continuity_CSp)
@@ -1419,12 +1438,12 @@ end subroutine seaice_step
 !> This subroutine sets up any auxiliary restart variables that are specific
 !! to the split-explicit time stepping scheme.  All variables registered here should
 !! have the ability to be recreated if they are not present in a restart file.
-subroutine register_restarts_dyn_split_RK2(HI, GV, US, param_file, CS, restart_CS, uh, vh)
+subroutine register_restarts_dyn_split_RK2e(HI, GV, US, param_file, CS, restart_CS, uh, vh)
   type(hor_index_type),          intent(in)    :: HI         !< Horizontal index structure
   type(verticalGrid_type),       intent(in)    :: GV         !< ocean vertical grid structure
   type(unit_scale_type),         intent(in)    :: US         !< A dimensional unit scaling type
   type(param_file_type),         intent(in)    :: param_file !< parameter file
-  type(MOM_dyn_split_RK2_CS),    pointer       :: CS         !< module control structure
+  type(MOM_dyn_split_RK2e_CS),    pointer       :: CS         !< module control structure
   type(MOM_restart_CS),          intent(inout) :: restart_CS !< MOM restart control structure
   real, dimension(SZIB_(HI),SZJ_(HI),SZK_(GV)), &
                          target, intent(inout) :: uh !< zonal volume or mass transport [H L2 T-1 ~> m3 s-1 or kg s-1]
@@ -1507,14 +1526,14 @@ subroutine register_restarts_dyn_split_RK2(HI, GV, US, param_file, CS, restart_C
 
   call register_barotropic_restarts(HI, GV, US, param_file, CS%barotropic_CSp, restart_CS)
 
-end subroutine register_restarts_dyn_split_RK2
+end subroutine register_restarts_dyn_split_RK2e
 
 !> This subroutine does remapping for the auxiliary restart variables that are used
 !! with the split RK2 time stepping scheme.
-subroutine remap_dyn_split_RK2_aux_vars(G, GV, CS, h_old_u, h_old_v, h_new_u, h_new_v, ALE_CSp)
+subroutine remap_dyn_split_RK2e_aux_vars(G, GV, CS, h_old_u, h_old_v, h_new_u, h_new_v, ALE_CSp)
   type(ocean_grid_type),            intent(inout) :: G        !< ocean grid structure
   type(verticalGrid_type),          intent(in)    :: GV       !< ocean vertical grid structure
-  type(MOM_dyn_split_RK2_CS),       pointer       :: CS       !< module control structure
+  type(MOM_dyn_split_RK2e_CS),       pointer       :: CS       !< module control structure
   real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), &
                                     intent(in)    :: h_old_u  !< Source grid thickness at zonal
                                                               !! velocity points [H ~> m or kg m-2]
@@ -1540,11 +1559,11 @@ subroutine remap_dyn_split_RK2_aux_vars(G, GV, CS, h_old_u, h_old_v, h_new_u, h_
 
   call ALE_remap_velocities(ALE_CSp, G, GV, h_old_u, h_old_v, h_new_u, h_new_v, CS%diffu, CS%diffv)
 
-end subroutine remap_dyn_split_RK2_aux_vars
+end subroutine remap_dyn_split_RK2e_aux_vars
 
 !> This subroutine initializes all of the variables that are used by this
 !! dynamic core, including diagnostics and the cpu clocks.
-subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, param_file, &
+subroutine initialize_dyn_split_RK2e(u, v, h, tv, uh, vh, eta, Time, G, GV, US, param_file, &
                       diag, CS, HA_CSp, restart_CS, dt, Accel_diag, Cont_diag, MIS, &
                       VarMix, MEKE, thickness_diffuse_CSp,                  &
                       OBC, update_OBC_CSp, ALE_CSp, set_visc, &
@@ -1567,7 +1586,7 @@ subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, p
   type(time_type),          target, intent(in)    :: Time       !< current model time
   type(param_file_type),            intent(in)    :: param_file !< parameter file for parsing
   type(diag_ctrl),          target, intent(inout) :: diag       !< to control diagnostics
-  type(MOM_dyn_split_RK2_CS),       pointer       :: CS         !< module control structure
+  type(MOM_dyn_split_RK2e_CS),       pointer       :: CS         !< module control structure
   type(harmonic_analysis_CS),       pointer       :: HA_CSp     !< A pointer to the control structure of the
                                                                 !! harmonic analysis module
   type(MOM_restart_CS),             intent(inout) :: restart_CS !< MOM restart control structure
@@ -2066,12 +2085,12 @@ subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, p
   id_clock_btstep     = cpu_clock_id('(Ocean barotropic mode stepping)', grain=CLOCK_MODULE)
   id_clock_btforce    = cpu_clock_id('(Ocean barotropic forcing calc)',  grain=CLOCK_MODULE)
 
-end subroutine initialize_dyn_split_RK2
+end subroutine initialize_dyn_split_RK2e
 
 
 !> Close the dyn_split_RK2 module
-subroutine end_dyn_split_RK2(CS)
-  type(MOM_dyn_split_RK2_CS), pointer :: CS  !< module control structure
+subroutine end_dyn_split_RK2e(CS)
+  type(MOM_dyn_split_RK2e_CS), pointer :: CS  !< module control structure
 
   call barotropic_end(CS%barotropic_CSp)
 
@@ -2101,7 +2120,7 @@ subroutine end_dyn_split_RK2(CS)
   deallocate(CS%AD_pred)
 
   deallocate(CS)
-end subroutine end_dyn_split_RK2
+end subroutine end_dyn_split_RK2e
 
 
 !> \namespace mom_dynamics_split_rk2

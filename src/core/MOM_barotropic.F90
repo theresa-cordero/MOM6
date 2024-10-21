@@ -2209,7 +2209,7 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
  
 ! TJM 
 ! The EVP function from the SIS2 model
-  call EVP_step_loop(CS%EVPT, G, uo, vo, PFu, PFv, fxoc, fyoc)
+!  call EVP_step_loop(CS%EVPT, G, uo, vo, PFu, PFv, fxoc, fyoc)
 !  call EVP_step_loop(dt_slow, ci, ui, vi, mice, uo, vo, &
 !                    fxat, fyat, fxoc, fyoc, pres_mice, diag_val, del_sh_min_pr, &
 !                    ui_min_trunc, ui_max_trunc, vi_min_trunc, vi_max_trunc, &

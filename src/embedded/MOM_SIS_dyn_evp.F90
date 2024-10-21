@@ -14,7 +14,7 @@ module MOM_SIS_dyn_evp
 !                                                                              !
 !~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~!
 
-use ice_grid,          only : ice_grid_type
+use MOM_ice_grid,          only : ice_grid_type
 
 use MOM_error_handler, only : MOM_error, FATAL, WARNING, NOTE, MOM_mesg
 use MOM_domains,       only : pass_var, pass_vector, CGRID_NE, CORNER, pe_here

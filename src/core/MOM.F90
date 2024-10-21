@@ -81,9 +81,9 @@ use MOM_dynamics_split_RK2,    only : MOM_dyn_split_RK2_CS, remap_dyn_split_rk2_
 use MOM_dynamics_split_RK2b,   only : step_MOM_dyn_split_RK2b, register_restarts_dyn_split_RK2b
 use MOM_dynamics_split_RK2b,   only : initialize_dyn_split_RK2b, end_dyn_split_RK2b
 use MOM_dynamics_split_RK2b,   only : MOM_dyn_split_RK2b_CS, remap_dyn_split_RK2b_aux_vars
-use MOM_dynamics_split_RK2e,   only : step_MOM_dyn_split_RK2e !, register_restarts_dyn_split_RK2b
-!use MOM_dynamics_split_RK2e,   only : initialize_dyn_split_RK2b, end_dyn_split_RK2b
-!use MOM_dynamics_split_RK2e,   only : MOM_dyn_split_RK2b_CS, remap_dyn_split_RK2b_aux_vars
+use MOM_dynamics_split_RK2e,   only : step_MOM_dyn_split_RK2e, register_restarts_dyn_split_RK2e
+use MOM_dynamics_split_RK2e,   only : initialize_dyn_split_RK2e, end_dyn_split_RK2e
+use MOM_dynamics_split_RK2e,   only : MOM_dyn_split_RK2e_CS, remap_dyn_split_RK2e_aux_vars
 use MOM_dynamics_unsplit_RK2,  only : step_MOM_dyn_unsplit_RK2, register_restarts_dyn_unsplit_RK2
 use MOM_dynamics_unsplit_RK2,  only : initialize_dyn_unsplit_RK2, end_dyn_unsplit_RK2
 use MOM_dynamics_unsplit_RK2,  only : MOM_dyn_unsplit_RK2_CS
@@ -299,6 +299,7 @@ type, public :: MOM_control_struct ; private
                                      !! scheme that exchanges velocities with step_MOM that have the
                                      !! average barotropic phase over a baroclinic timestep rather
                                      !! than the instantaneous barotropic phase.
+  logical :: use_dynmer_ice
   logical :: use_RK2                 !< If true, use RK2 instead of RK3 in unsplit mode
                                      !! (i.e., no split between barotropic and baroclinic).
   logical :: interface_filter        !< If true, apply an interface height filter immediately
@@ -395,6 +396,8 @@ type, public :: MOM_control_struct ; private
   type(MOM_dyn_split_RK2_CS),    pointer :: dyn_split_RK2_CSp => NULL()
     !< Pointer to the control structure used for the mode-split RK2 dynamics
   type(MOM_dyn_split_RK2b_CS),    pointer :: dyn_split_RK2b_CSp => NULL()
+    !< Pointer to the control structure used for an alternate version of the mode-split RK2 dynamics
+  type(MOM_dyn_split_RK2e_CS),    pointer :: dyn_split_RK2e_CSp => NULL()
     !< Pointer to the control structure used for an alternate version of the mode-split RK2 dynamics
   type(harmonic_analysis_CS),    pointer :: HA_CSp => NULL()
     !< Pointer to the control structure for harmonic analysis
@@ -1258,10 +1261,10 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
                   p_surf_begin, p_surf_end, CS%uh, CS%vh, CS%uhtr, CS%vhtr, &
                   CS%eta_av_bc, G, GV, US, CS%dyn_split_RK2b_CSp, calc_dtbt, CS%VarMix, &
                   CS%MEKE, CS%thickness_diffuse_CSp, CS%pbv, waves=waves)
-    elseif (CS%use_embedded_ice) then
+    elseif (CS%use_dynmer_ice) then
       call step_MOM_dyn_split_RK2e(u, v, h, CS%tv, CS%visc, Time_local, dt, forces, &
                   p_surf_begin, p_surf_end, CS%uh, CS%vh, CS%uhtr, CS%vhtr, &
-                  CS%eta_av_bc, G, GV, US, CS%dyn_split_RK2_CSp, calc_dtbt, CS%VarMix, &
+                  CS%eta_av_bc, G, GV, US, CS%dyn_split_RK2e_CSp, calc_dtbt, CS%VarMix, &
                   CS%MEKE, CS%thickness_diffuse_CSp, CS%pbv, waves=waves, seaice=seaice)
     else
       call step_MOM_dyn_split_RK2(u, v, h, CS%tv, CS%visc, Time_local, dt, forces, &
@@ -1701,6 +1704,8 @@ subroutine step_MOM_thermo(CS, G, GV, US, u, v, h, tv, fluxes, dtdia, &
         if (CS%split .and. CS%use_alt_split) then
           call remap_dyn_split_RK2b_aux_vars(G, GV, CS%dyn_split_RK2b_CSp, h_old_u, h_old_v, &
                                              h_new_u, h_new_v, CS%ALE_CSp)
+        elseif (CS%use_dynmer_ice) then
+          call remap_dyn_split_RK2e_aux_vars(G, GV, CS%dyn_split_RK2e_CSp, h_old_u, h_old_v, h_new_u, h_new_v, CS%ALE_CSp)
         elseif (CS%split) then
           call remap_dyn_split_RK2_aux_vars(G, GV, CS%dyn_split_RK2_CSp, h_old_u, h_old_v, h_new_u, h_new_v, CS%ALE_CSp)
         endif
@@ -2229,6 +2234,10 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
                  "If true, use RK2 instead of RK3 in the unsplit time stepping.", &
                  default=.false.)
   endif
+  call get_param(param_file, "MOM", "USE_DYN_MERGED_ICE", CS%use_dynmer_ice, &
+                 "If true, use a version of the split explicit time stepping scheme that "//&
+                 "also steps the merged sea ice state with the baroclinic steps of the "//&
+                 "ocean.", default=.false., do_not_log=.not.CS%split)
 
   call get_param(param_file, "MOM", "BOUSSINESQ", Boussinesq, &
                  "If true, make the Boussinesq approximation.", default=.true., do_not_log=.true.)
@@ -2842,6 +2851,9 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   if (CS%split .and. CS%use_alt_split) then
     call register_restarts_dyn_split_RK2b(HI, GV, US, param_file, &
              CS%dyn_split_RK2b_CSp, restart_CSp, CS%uh, CS%vh)
+  elseif (CS%split .and. CS%use_dynmer_ice) then
+    call register_restarts_dyn_split_RK2e(HI, GV, US, param_file, &
+             CS%dyn_split_RK2e_CSp, restart_CSp, CS%uh, CS%vh)
   elseif (CS%split) then
     call register_restarts_dyn_split_RK2(HI, GV, US, param_file, &
              CS%dyn_split_RK2_CSp, restart_CSp, CS%uh, CS%vh)
@@ -2944,6 +2956,33 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   if (use_ice_shelf) then
     point_calving=.false.; if (present(calve_ice_shelf_bergs)) point_calving=calve_ice_shelf_bergs
   endif
+
+  !if dyn/merged ice
+  !  if (.not.associated(OS%seaice)) allocate(OS%seaice)
+  !  allocate( OS%seaice%mi_sum(isd:ied,jsd:jed) )
+  !  allocate( OS%seaice%ice_cover(isd:ied,jsd:jed))
+  !  allocate( OS%seaice%u_ice_C(IsdB:IedB,jsd:jed))
+  !  allocate( OS%seaice%v_ice_C(isd:ied,JsdB:JedB))
+  !  allocate( OS%seaice%uh_step(IsdB:IedB,jsd:jed))
+  !  allocate( OS%seaice%vh_step(isd:ied,JsdB:JedB))
+  !  allocate( OS%seaice%mca_step(isd:ied,jsd:jed))
+  !  ! only needed for embedded/semiembedded coupling
+  !  if (.not.associated(ice_ocean_boundary%IceDS2d%FIA_2d)) allocate(ice_ocean_boundary%IceDS2d%FIA_2d)
+  !  allocate( OS%seaice%FIA_2d%ice_cover(isd:ied,jsd:jed))
+  !  allocate( OS%seaice%FIA_2d%ice_free(isd:ied,jsd:jed))
+  !  allocate( OS%seaice%FIA_2d%WindStr_x(IsdB:IedB,jsd:jed))
+  !  allocate( OS%seaice%FIA_2d%WindStr_y(isd:ied,JsdB:JedB))
+  !  allocate( OS%seaice%FIA_2d%WindStr_ocn_x(IsdB:IedB,jsd:jed))
+  !  allocate( OS%seaice%FIA_2d%WindStr_ocn_y(isd:ied,JsdB:JedB))
+  !  if (.not.associated(OS%seaice%dynmer_trans_CSp)) allocate(OS%seaice%dynmer_trans_CSp)
+  !  if (.not.associated(OS%seaice%dynmer_trans_CSp%diag)) allocate(OS%seaice%dynmer_trans_CSp%diag)
+  !  if (.not.associated(OS%seaice%dynmer_trans_CSp%continuity_CSp)) allocate(OS%seaice%dynmer_trans_CSp%continuity_CSp )
+  !  if (.not.associated(OS%seaice%dynmer_trans_CSp%cover_trans_CSp)) allocate(OS%seaice%dynmer_trans_CSp%cover_trans_CSp)
+  !  if (.not.associated(OS%seaice%SIS_C_dyn_CSp)) allocate(OS%seaice%SIS_C_dyn_CSp)
+  !  if (.not.associated(OS%seaice%sG)) allocate(OS%seaice%sG)
+  !  if (.not.associated(OS%seaice%US)) allocate(OS%seaice%US)
+  !  if (.not.associated(OS%seaice%IG)) allocate(OS%seaice%IG)
+  !endif  
 
   if (CS%rotate_index) then
     G_in%ke = GV%ke
@@ -3267,6 +3306,12 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
     if (CS%use_alt_split) then
       call initialize_dyn_split_RK2b(CS%u, CS%v, CS%h, CS%tv, CS%uh, CS%vh, eta, Time, &
               G, GV, US, param_file, diag, CS%dyn_split_RK2b_CSp, CS%HA_CSp, restart_CSp, &
+              CS%dt, CS%ADp, CS%CDp, MOM_internal_state, CS%VarMix, CS%MEKE, &
+              CS%thickness_diffuse_CSp, CS%OBC, CS%update_OBC_CSp, CS%ALE_CSp, CS%set_visc_CSp, &
+              CS%visc, dirs, CS%ntrunc, CS%pbv, calc_dtbt=calc_dtbt, cont_stencil=CS%cont_stencil)
+    elseif (CS%use_dynmer_ice) then
+      call initialize_dyn_split_RK2e(CS%u, CS%v, CS%h, CS%tv, CS%uh, CS%vh, eta, Time, &
+              G, GV, US, param_file, diag, CS%dyn_split_RK2e_CSp, CS%HA_CSp, restart_CSp, &
               CS%dt, CS%ADp, CS%CDp, MOM_internal_state, CS%VarMix, CS%MEKE, &
               CS%thickness_diffuse_CSp, CS%OBC, CS%update_OBC_CSp, CS%ALE_CSp, CS%set_visc_CSp, &
               CS%visc, dirs, CS%ntrunc, CS%pbv, calc_dtbt=calc_dtbt, cont_stencil=CS%cont_stencil)
@@ -4226,6 +4271,8 @@ subroutine MOM_end(CS)
 
   if (CS%split .and. CS%use_alt_split) then
     call end_dyn_split_RK2b(CS%dyn_split_RK2b_CSp)
+  elseif (CS%split .and. CS%use_dynmer_ice) then
+    call end_dyn_split_RK2e(CS%dyn_split_RK2e_CSp)
   elseif (CS%split) then
     call end_dyn_split_RK2(CS%dyn_split_RK2_CSp)
   elseif (CS%use_RK2) then

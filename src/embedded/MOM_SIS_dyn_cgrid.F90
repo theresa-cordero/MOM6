@@ -14,7 +14,7 @@ module MOM_SIS_dyn_cgrid
 !                                                                              !
 !~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~!
 
-use ice_grid,          only : ice_grid_type
+use MOM_ice_grid,          only : ice_grid_type
 
 use MOM_error_handler, only : SIS_error=>MOM_error, FATAL, WARNING, NOTE, SIS_mesg=>MOM_mesg
 use MOM_file_parser,   only : get_param, log_param, read_param, log_version, param_file_type
@@ -450,7 +450,6 @@ subroutine SIS_C_dyn_init(Time, G, US, param_file, diag, CS, ntrunc)
 
 end subroutine SIS_C_dyn_init
 
-
 !~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~!
 !> find_ice_strength returns the magnitude of force on ice in plastic deformation
 subroutine find_ice_strength(mi, ci, ice_strength, G, US, CS, halo_sz) ! ??? may change to do loop
@@ -884,10 +883,10 @@ subroutine SIS_C_dynamics(ci, mis, mice, ui, vi, uo, vo, fxat, fyat, &
 !$OMP end parallel
 
   if (CS%debug .or. CS%debug_redundant) then
-    call uvchksum("PF[uv] in SIS_C_dynamics", PFu, PFv, G, scale=US%L_T_to_m_s*US%s_to_T)
-    call uvchksum("f[xy]at in SIS_C_dynamics", fxat, fyat, G, scale=US%RZ_T_to_kg_m2s*US%L_T_to_m_s)
-    call uvchksum("[uv]i pre-steps SIS_C_dynamics", ui, vi, G, scale=US%L_T_to_m_s)
-    call uvchksum("[uv]o in SIS_C_dynamics", uo, vo, G, scale=US%L_T_to_m_s)
+  !  call uvchksum("PF[uv] in SIS_C_dynamics", PFu, PFv, G, scale=US%L_T_to_m_s*US%s_to_T)
+  !  call uvchksum("f[xy]at in SIS_C_dynamics", fxat, fyat, G, scale=US%RZ_T_to_kg_m2s*US%L_T_to_m_s)
+  !  call uvchksum("[uv]i pre-steps SIS_C_dynamics", ui, vi, G, scale=US%L_T_to_m_s)
+  !  call uvchksum("[uv]o in SIS_C_dynamics", uo, vo, G, scale=US%L_T_to_m_s)
   endif
 
   dt_cumulative = 0.0
