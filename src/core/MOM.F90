@@ -860,7 +860,9 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
       ! Apply diabatic forcing, do mixing, and regrid.
       call step_MOM_thermo(CS, G, GV, US, u, v, h, CS%tv, fluxes, dtdia, &
                            end_time_thermo, .true., Waves=Waves)
-      call ALE_gridgen_and_remapping(CS, G, GV, US, u, v, h, CS%tv, dtdia, Time_local)
+      if ( CS%use_ALE_algorithm ) &
+        call ALE_gridgen_and_remapping(CS, G, GV, US, u, v, h, CS%tv, dtdia, Time_local)
+      call update_tracers_after_ALE(CS, G, GV, US, u, v, h, CS%tv)
       CS%time_in_thermo_cycle = CS%time_in_thermo_cycle + dtdia
 
       ! The diabatic processes are now ahead of the dynamics by dtdia.
@@ -964,7 +966,9 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
       ! Apply diabatic forcing, do mixing, and regrid.
       call step_MOM_thermo(CS, G, GV, US, u, v, h, CS%tv, fluxes, dtdia, &
                            Time_local, .false., Waves=Waves)
-      call ALE_gridgen_and_remapping(CS, G, GV, US, u, v, h, CS%tv, dtdia, Time_local)
+      if ( CS%use_ALE_algorithm ) &
+        call ALE_gridgen_and_remapping(CS, G, GV, US, u, v, h, CS%tv, dtdia, Time_local)
+      call update_tracers_after_ALE(CS, G, GV, US, u, v, h, CS%tv)
       CS%time_in_thermo_cycle = CS%time_in_thermo_cycle + dtdia
 
       if ((CS%t_dyn_rel_thermo==0.0) .and. .not.do_dyn) then
@@ -1789,27 +1793,12 @@ subroutine ALE_gridgen_and_remapping(CS, G, GV, US, u, v, h, tv, dtdia, Time_end
     h(i,j,k) = h_new(i,j,k)
   enddo ; enddo ; enddo
 
+  call diag_update_remap_grids(CS%diag)
+  call postALE_tracer_diagnostics(CS%tracer_Reg, G, GV, CS%diag, dtdia)
+
   if (showCallTree) call callTree_waypoint("finished ALE_regrid (step_MOM_thermo)")
   call cpu_clock_end(id_clock_ALE)
-
-  if (CS%use_particles) then
-    call particles_to_k_space(CS%particles, h)
-  endif
-
-  dynamics_stencil = min(3, G%Domain%nihalo, G%Domain%njhalo)
-  call create_group_pass(pass_uv_T_S_h, u, v, G%Domain, halo=dynamics_stencil)
-  if (associated(tv%T)) &
-    call create_group_pass(pass_uv_T_S_h, tv%T, G%Domain, halo=dynamics_stencil)
-  if (associated(tv%S)) &
-    call create_group_pass(pass_uv_T_S_h, tv%S, G%Domain, halo=dynamics_stencil)
-  call create_group_pass(pass_uv_T_S_h, h, G%Domain, halo=dynamics_stencil)
-  call do_group_pass(pass_uv_T_S_h, G%Domain, clock=id_clock_pass)
-
-  ! Update derived thermodynamic quantities.
-  if (allocated(tv%SpV_avg)) then
-    call calc_derived_thermo(tv, h, G, GV, US, halo=dynamics_stencil, debug=CS%debug)
-  endif
-
+  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
   if (CS%debug .and. CS%use_ALE_algorithm) then
     call MOM_state_chksum("Post-ALE ", u, v, h, CS%uh, CS%vh, G, GV, US)
     call hchksum(tv%T, "Post-ALE T", G%HI, haloshift=1, unscale=US%C_to_degC)
@@ -1817,14 +1806,6 @@ subroutine ALE_gridgen_and_remapping(CS, G, GV, US, u, v, h, tv, dtdia, Time_end
     if (debug_redundant) &
       call check_redundant("Post-ALE ", u, v, G, unscale=US%L_T_to_m_s)
   endif
-
-  ! Whenever thickness changes let the diag manager know, target grids
-  ! for vertical remapping may need to be regenerated. This needs to
-  ! happen after the H update and before the next post_data.
-  call diag_update_remap_grids(CS%diag)
-
-  call postALE_tracer_diagnostics(CS%tracer_Reg, G, GV, CS%diag, dtdia)
-
   if (CS%debug) then
     call uvchksum("Post-ALE, Post-diabatic u", u, v, G%HI, haloshift=2, unscale=US%L_T_to_m_s)
     call hchksum(h, "Post-ALE, Post-diabatic h", G%HI, haloshift=1, unscale=GV%H_to_MKS)
@@ -1846,11 +1827,53 @@ subroutine ALE_gridgen_and_remapping(CS, G, GV, US, u, v, h, tv, dtdia, Time_end
 
   call cpu_clock_end(id_clock_remap)
 
-  call disable_averaging(CS%diag)
-
   if (showCallTree) call callTree_leave("ALE_gridgen_and_remapping(), MOM.F90")
 
 end subroutine ALE_gridgen_and_remapping
+
+subroutine update_tracers_after_ALE(CS, G, GV, US, u, v, h, tv)
+  type(MOM_control_struct), intent(inout) :: CS     !< Master MOM control structure
+  type(ocean_grid_type),    intent(inout) :: G      !< ocean grid structure
+  type(verticalGrid_type),  intent(inout) :: GV     !< ocean vertical grid structure
+  type(unit_scale_type),    intent(in)    :: US     !< A dimensional unit scaling type
+  real, dimension(SZIB_(G),SZJ_(G),SZK_(GV)), &
+                            intent(inout) :: u      !< zonal velocity [L T-1 ~> m s-1]
+  real, dimension(SZI_(G),SZJB_(G),SZK_(GV)), &
+                            intent(inout) :: v      !< meridional velocity [L T-1 ~> m s-1]
+  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), &
+                            intent(inout) :: h      !< layer thickness [H ~> m or kg m-2]
+  type(thermo_var_ptrs),    intent(inout) :: tv     !< A structure pointing to various thermodynamic variables
+
+  logical :: debug_redundant ! If true, check redundant values on PE boundaries when debugging.
+  logical :: showCallTree
+  type(group_pass_type) :: pass_T_S, pass_T_S_h, pass_uv_T_S_h
+  integer :: dynamics_stencil  ! The computational stencil for the calculations
+                               ! in the dynamic core.
+  integer :: i, j, k, is, ie, js, je, nz
+
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
+  showCallTree = callTree_showQuery()
+  if (showCallTree) call callTree_enter("(), MOM.F90")
+  if (CS%debug) call query_debugging_checks(do_redundant=debug_redundant)
+
+  if (CS%use_particles) then
+    call particles_to_k_space(CS%particles, h)
+  endif
+
+  dynamics_stencil = min(3, G%Domain%nihalo, G%Domain%njhalo)
+  call create_group_pass(pass_uv_T_S_h, u, v, G%Domain, halo=dynamics_stencil)
+  if (associated(tv%T)) &
+    call create_group_pass(pass_uv_T_S_h, tv%T, G%Domain, halo=dynamics_stencil)
+  if (associated(tv%S)) &
+    call create_group_pass(pass_uv_T_S_h, tv%S, G%Domain, halo=dynamics_stencil)
+  call create_group_pass(pass_uv_T_S_h, h, G%Domain, halo=dynamics_stencil)
+  call do_group_pass(pass_uv_T_S_h, G%Domain, clock=id_clock_pass)
+
+  ! Update derived thermodynamic quantities.
+  if (allocated(tv%SpV_avg)) then
+    call calc_derived_thermo(tv, h, G, GV, US, halo=dynamics_stencil, debug=CS%debug)
+  endif
+end subroutine update_tracers_after_ALE
 
 !> step_offline is the main driver for running tracers offline in MOM6. This has been primarily
 !! developed with ALE configurations in mind. Some work has been done in isopycnal configuration, but
