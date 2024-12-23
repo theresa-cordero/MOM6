@@ -30,9 +30,7 @@ module MOM_generic_tracer
   use g_tracer_utils,   only: g_tracer_get_obc_segment_props
 
   use MOM_ALE_sponge, only : set_up_ALE_sponge_field, ALE_sponge_CS
-  use MOM_ALE_sponge, only : ALE_sponge_CS, initialize_ALE_sponge
   use MOM_coms, only : EFP_type, max_across_PEs, min_across_PEs, PE_here
-  use MOM_diagnose_mld,  only : diagnoseMLDbyDensityDifference, diagnoseMLDbyEnergy
   use MOM_diag_mediator, only : post_data, register_diag_field, safe_alloc_ptr
   use MOM_diag_mediator, only : diag_ctrl, get_diag_time_end
   use MOM_error_handler, only : MOM_error, FATAL, WARNING, NOTE, is_root_pe
@@ -84,14 +82,6 @@ module MOM_generic_tracer
                                    !! concentration units [conc]
     logical :: tracers_may_reinit  !< If true, tracers may go through the
                                    !! initialization code if they are not found in the restart files.
-
-    logical :: mld_pha_calc = .False.           !< If true, use a fixed value for photoacclimation MLD
-    real    :: mld_pha_val = 0.0                !< The value of fixed photoacclimation MLD
-    logical :: mld_pha_use_delta_rho = .False.  !< If true, use a density diference to find the MLD
-    real    :: mld_pha_href = 0.0               !< The reference depth for density difference based MLD
-    real    :: mld_pha_drho = 0.03              !< The density thershold for a density difference based MLD
-    logical :: mld_pha_use_delta_eng = .False.  !< If true, use an energy diference to find the MLD
-    real    :: mld_pha_deng = 25.0              !< The energy threshold for an energy d ifference based MLD
 
     type(diag_ctrl), pointer :: diag => NULL() !< A structure that is used to
                                                !! regulate the timing of diagnostic output.
@@ -318,7 +308,6 @@ contains
 
     character(len=128), parameter :: sub_name = 'initialize_MOM_generic_tracer'
     logical :: OK,obc_has
-    logical :: do_use_GT_sponge
     integer :: i, j, k, isc, iec, jsc, jec, nk
     type(g_tracer_type), pointer    :: g_tracer,g_tracer_next
     character(len=fm_string_len)      :: g_tracer_name
@@ -434,42 +423,6 @@ contains
     enddo
     !! end section to re-initialize generic tracers
 
-    call get_param(param_file, "MOM", "PHA_MLD_CALC", CS%mld_pha_calc, &
-                 "If false, use a fixed value for the photoacclimation mixed layer depth within the "//&
-                 "generic tracer update. This MLD is only used for photoacclimation. This variable should "//&
-                 "be set to true if using COBALTv3 for the BGC.", default=.false.)
-    if (CS%mld_pha_calc) then
-      call get_param(param_file, "MOM", "PHA_MLD_USE_DELTA_RHO", CS%mld_pha_use_delta_rho, &
-                   "If true, use a density difference to find the photoacclimation mixed layer depth "//&
-                   "within the generic tracer update. This MLD is only used for photoacclimation.", default=.false.)
-      call get_param(param_file, "MOM", "PHA_MLD_USE_DELTA_ENG", CS%mld_pha_use_delta_eng, &
-                   "If true, use an energy difference to find the photoacclimation mixed layer depth "//&
-                   "with the generic tracer update. This MLD is only used for photoacclimation.", default=.false.)
-      if (CS%mld_pha_use_delta_rho .and. CS%mld_pha_use_delta_eng) then
-        call MOM_error(FATAL, "PHA_MLD_CALC is set to true and PHA_MLD_USE_DELTA_RHO and PHA_MLD_USE_DELTA_ENG "// &
-                              "are both true. Choose only one option for the calculated photoacclimation MLD!")
-      elseif ((.not.CS%mld_pha_use_delta_rho) .and. (.not.CS%mld_pha_use_delta_eng)) then
-        call MOM_error(FATAL, "PHA_MLD_CALC is set to true but PHA_MLD_USE_DELTA_RHO and PHA_MLD_USE_DELTA_ENG "// &
-                              "are both false. Choose an option for the calculated photoacclimation MLD!")
-      endif
-      if (CS%mld_pha_use_delta_rho) then
-        call get_param(param_file, "MOM", "PHA_MLD_HREF", CS%mld_pha_href, &
-                     "The reference depth for a density difference based photoacclimation MLD [m].",  &
-                      units='m', default=0.0, scale=US%m_to_Z, do_not_log=.not.CS%mld_pha_use_delta_rho)
-        call get_param(param_file, "MOM", "PHA_MLD_DRHO", CS%mld_pha_drho, &
-                     "The density difference for a density difference based photoacclimation MLD [kg m-3].", &
-                      units='kg/m3', default=0.03, scale=US%kg_m3_to_R, do_not_log=.not.CS%mld_pha_use_delta_rho)
-      elseif (CS%mld_pha_use_delta_eng) then
-        call get_param(param_file, "MOM", "PHA_MLD_DENG", CS%mld_pha_deng, &
-                     "The energy for an energy difference based photoacclimation MLD.", default=25.0, &
-                     units='J/m2',scale=US%W_m2_to_RZ3_T3*US%s_to_T, do_not_log=.not.CS%mld_pha_use_delta_eng)
-      endif
-    else
-      call get_param(param_file, "MOM", "PHA_MLD_VAL", CS%mld_pha_val, &
-                   "The depth of photoacclimation if fixed depth is used [m].", &
-                    units='m', default=0.0, scale=US%m_to_Z)
-    endif
-
 
     !Now we can reset the grid mask, axes and time to their true values
     !Note that grid_tmask must be set correctly on the data domain boundary
@@ -485,10 +438,6 @@ contains
     call g_tracer_set_common(G%isc,G%iec,G%jsc,G%jec,G%isd,G%ied,G%jsd,G%jed,&
                              GV%ke,1,CS%diag%axesTL%handles,grid_tmask,grid_kmt,day)
 
-    call get_param(param_file, "initialize_sponges_file", "DO_SPONGE_GENERIC_TRACER", do_use_gt_sponge, &
-                   "If true, then some generic tracers may be nudged.", default=.false.)
-    if (do_use_GT_sponge) call g_tracer_initialize_sponges(G, GV, US, CS, param_file, sponge_CSp, ALE_sponge_CSp, day)
-
     ! Register generic tracer modules diagnostics
 
 #ifdef _USE_MOM6_DIAG
@@ -500,147 +449,6 @@ contains
 #endif
 
   end subroutine initialize_MOM_generic_tracer
-
-  subroutine  g_tracer_initialize_sponges(G, GV, US, CS, param_file, Layer_CSp, ALE_CSp, Time)
-    type(ocean_grid_type),   intent(in) :: G    !< The ocean's grid structure.
-    type(verticalGrid_type), intent(in) :: GV   !< The ocean's vertical grid structure.
-    type(unit_scale_type),   intent(in) :: US   !< A dimensional unit scaling type
-    real, dimension(SZI_(G),SZJ_(G)) :: depth_tot  !< The nominal total depth of the ocean [Z ~> m]
-    type(MOM_generic_tracer_CS), pointer :: CS      !< Pointer to the control structure for this module.
-    type(param_file_type),   intent(in)  :: param_file !< A structure to parse for run-time parameters.
-    type(sponge_CS),         pointer     :: Layer_CSp  !< A pointer that is set to point to the control
-                                                       !! structure for this module (in layered mode).
-    type(ALE_sponge_CS),     pointer     :: ALE_CSp  !< A pointer that is set to point to the control
-                                                     !! structure for this module (in ALE mode).
-    type(time_type),         intent(in)  :: Time !< Time at the start of the run segment. Time_in
-                                                 !! overrides any value set for Time.
-    ! Local variables
-    real, allocatable, dimension(:,:,:) :: eta ! The target interface heights [Z ~> m].
-    real, allocatable, dimension(:,:,:) :: dz  ! The target interface thicknesses in height units [Z ~> m]
-    real, allocatable, dimension(:,:,:) :: h   ! The target interface thicknesses [H ~> m or kg m-2].
-
-    real, allocatable, dimension(:,:,:) :: tmp_GT ! A temporary array for reading sponge target temperatures
-                                      ! on the vertical grid of the input file  [C ~> degC]
-
-    real :: Idamp(SZI_(G),SZJ_(G))    ! The sponge damping rate [T-1 ~> s-1]
-
-    integer :: i, j, k, is, ie, js, je, nz
-    integer :: isd, ied, jsd, jed
-    integer, dimension(4) :: siz
-    integer :: nz_data  ! The size of the sponge source grid
-    character(len=40) :: tmp_var, Idamp_var, eta_var
-    character(len=40) :: mdl = "initialize_sponges_file"
-    character(len=200) :: damping_file, state_file, state_uv_file  ! Strings for filenames
-    character(len=200) :: filename, inputdir ! Strings for file/path and path.
-
-    character(len=200) :: g_tracer_name
-    type(g_tracer_type), pointer    :: g_tracer,g_tracer_next
-    logical :: do_sponge_gt
-    real, dimension(:,:,:), pointer    :: g_tracer_ptr
-
-    logical :: use_ALE ! True if ALE is being used, False if in layered mode
-    logical :: time_space_interp_sponge ! If true use sponge data that need to be interpolated in both
-                                ! the horizontal dimension and in time prior to vertical remapping.
-
-    is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
-    isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
-
-    Idamp(:,:) = 0.0
-
-    call get_param(param_file, mdl, "INPUTDIR", inputdir, default=".")
-    inputdir = slasher(inputdir)
-    call get_param(param_file, mdl, "SPONGE_GT_DAMPING_FILE", damping_file, &
-                   "The name of the file with the sponge damping rates.") !, &
-    call get_param(param_file, mdl, "SPONGE_IDAMP_VAR", Idamp_var, &
-                   "The name of the inverse damping rate variable in "//&
-                   "SPONGE_DAMPING_FILE.", default="Idamp")
-    call get_param(param_file, mdl, "USE_REGRIDDING", use_ALE, default=.false., do_not_log=.true.)
-    call get_param(param_file, mdl, "INTERPOLATE_SPONGE_TIME_SPACE", time_space_interp_sponge, &
-                   "If True, perform on-the-fly regridding in lat-lon-time of sponge restoring data.", &
-                   default=.false.)
-
-    ! Read in sponge damping rate for tracers
-    filename = trim(inputdir)//trim(damping_file)
-    call log_param(param_file, mdl, "INPUTDIR/SPONGE_DAMPING_FILE", filename)
-    if (.not.file_exists(filename, G%Domain)) &
-      call MOM_error(FATAL, " initialize_sponges: Unable to open "//trim(filename))
-
-    call MOM_read_data(filename, Idamp_var, Idamp(:,:), G%Domain, scale=US%T_to_s)
-
-    ! Now register all of the fields which are damped in the sponge.
-    ! By default, momentum is advected vertically within the sponge, but
-    ! momentum is typically not damped within the sponge.
-
-    g_tracer=>CS%g_tracer_list
-    do ! check for each generic tracer if it is nudged
-
-      call g_tracer_get_alias(g_tracer,g_tracer_name)
-
-      call get_param(param_file, mdl, "DO_SPONGE_GT_"//trim(g_tracer_name), do_sponge_gt, &
-                     "If true, then generic tracer "//trim(g_tracer_name)//" is nudged.", &
-                     default=.false.)
-
-      if (do_sponge_gt) then
-        call get_param(param_file, mdl, "SPONGE_GT_"//trim(g_tracer_name)//"_FILE", state_file, &
-                       "The name of the file with the state to damp the generic ", &
-                       "tracer "//trim(g_tracer_name)//" toward.",  default="sponge_"//trim(g_tracer_name)//".nc.")
-        call get_param(param_file, mdl, "SPONGE_GT_"//trim(g_tracer_name)//"_VAR", tmp_var, &
-                       "The name of the variable to use in the sponge_GT file for generic ", &
-                       "tracer "//trim(g_tracer_name)//".",  default=trim(g_tracer_name))
-        call get_param(param_file, mdl, "SPONGE_GT_"//trim(g_tracer_name)//"_ETA_VAR", eta_var, &
-                       "The name of the interface height variable in "//&
-                       "SPONGE_GT_"//trim(g_tracer_name)//"_FILE.", default="ETA")
-
-        filename = trim(inputdir)//trim(state_file)
-        call log_param(param_file, mdl, "INPUTDIR/SPONGE_GT"//trim(g_tracer_name)//"_FILE", filename)
-        if (.not.file_exists(filename, G%Domain)) &
-          call MOM_error(FATAL, " initialize_sponges: Unable to open "//trim(filename))
-
-        ! get the pointer for this tracer
-        call g_tracer_get_pointer(g_tracer,g_tracer_name,'field',g_tracer_ptr)
-
-        if  (use_ALE) then ! ALE mode
-          if (.not. time_space_interp_sponge) then
-            !call field_size(filename,eta_var,siz,no_domain=.true.)
-            if (siz(1) /= G%ieg-G%isg+1 .or. siz(2) /= G%jeg-G%jsg+1) &
-              call MOM_error(FATAL,"initialize_sponge_file: Array size mismatch for sponge data.")
-            nz_data = siz(3)-1
-            allocate(eta(isd:ied,jsd:jed,nz_data+1))
-            allocate(dz(isd:ied,jsd:jed,nz_data))
-            call MOM_read_data(filename, eta_var, eta(:,:,:), G%Domain, scale=US%m_to_Z)
-            do j=js,je ; do i=is,ie
-              eta(i,j,nz_data+1) = -depth_tot(i,j)
-            enddo ; enddo
-            do k=nz_data,1,-1 ; do j=js,je ; do i=is,ie
-              if (eta(i,j,K) < (eta(i,j,K+1) + GV%Angstrom_Z)) &
-                eta(i,j,K) = eta(i,j,K+1) + GV%Angstrom_Z
-            enddo ; enddo ; enddo
-            do k=1,nz_data ; do j=js,je ; do i=is,ie
-              dz(i,j,k) = eta(i,j,k)-eta(i,j,k+1)
-            enddo; enddo ; enddo
-            deallocate(eta)
-
-            allocate(tmp_GT(isd:ied,jsd:jed,nz_data))
-            call MOM_read_data(filename, tmp_var, tmp_GT(:,:,:), G%Domain) !, scale=US%degC_to_C)
-
-            call set_up_ALE_sponge_field(tmp_GT, G, GV, g_tracer_ptr, &
-                                         ALE_CSp, trim(g_tracer_name))
-            deallocate(tmp_GT)
-            deallocate(dz)
-
-          else
-            call set_up_ALE_sponge_field(filename, tmp_var, Time, G, GV, US, g_tracer_ptr, &
-                                         ALE_CSp, trim(g_tracer_name))
-          endif
-        endif
-      endif
-
-      call g_tracer_get_next(g_tracer, g_tracer_next)
-      if (.NOT. associated(g_tracer_next)) exit
-      g_tracer=>g_tracer_next
-    enddo
-
-  end subroutine g_tracer_initialize_sponges
 
   !>  Column physics for generic tracers.
   !!      Get the coupler values for generic tracers that exchange with atmosphere
@@ -699,8 +507,6 @@ contains
     real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: rho_dzt ! Layer mass per unit area [kg m-2]
     real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: dzt     ! Layer vertical extents [m]
     real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: h_work  ! A work array of thicknesses [H ~> m or kg m-2]
-    real, dimension(SZI_(G),SZJ_(G)) :: mld_pha          ! The mixed layer depth calculated for photoacclimation
-                                                         ! that is used in COBALTv3
     integer :: i, j, k, isc, iec, jsc, jec, nk
 
     isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec ; nk = GV%ke
@@ -766,17 +572,6 @@ contains
     enddo ; enddo
     sosga = global_area_mean(surface_field, G, unscale=US%S_to_ppt)
 
-    mld_pha(:,:) = 0.0          
-    if (.not.CS%mld_pha_calc) then
-      mld_pha(:,:) = CS%mld_pha_val
-    else
-      if (CS%mld_pha_use_delta_rho) then
-        call diagnoseMLDbyDensityDifference(-1, h_old, tv, CS%mld_pha_drho, G, GV, US, CS%diag, CS%mld_pha_href, id_ref_z=-1, id_ref_rho=-1, MLD_out=mld_pha)
-      elseif (CS%mld_pha_use_delta_eng) then
-        call diagnoseMLDbyEnergy((/-1, -1, -1/), h_old, tv, G, GV, US, (/CS%mld_pha_deng, CS%mld_pha_deng, CS%mld_pha_deng/), CS%diag, MLD_out=mld_pha)
-      endif
-    endif
-
     !
     !Calculate tendencies (i.e., field changes at dt) from the sources / sinks
     !
@@ -787,8 +582,7 @@ contains
       call generic_tracer_source(tv%T, tv%S, rho_dzt, dzt, dz_ml, G%isd, G%jsd, 1, dt, &
                G%areaT, get_diag_time_end(CS%diag), &
                optics%nbands, optics%max_wavelength_band, optics%sw_pen_band, optics%opacity_band, &
-               internal_heat=tv%internal_heat, frunoff=fluxes%frunoff, sosga=sosga, geolat=G%geolatT, &
-               photo_acc_dpth=mld_pha)
+               internal_heat=tv%internal_heat, frunoff=fluxes%frunoff, sosga=sosga)
     else
       ! tv%internal_heat is a null pointer unless DO_GEOTHERMAL = True,
       ! so we have to check and only do the scaling if it is associated.
@@ -799,16 +593,14 @@ contains
                sw_pen_band=G%US%QRZ_T_to_W_m2*optics%sw_pen_band(:,:,:), &
                opacity_band=G%US%m_to_Z*optics%opacity_band(:,:,:,:), &
                internal_heat=G%US%RZ_to_kg_m2*US%C_to_degC*tv%internal_heat(:,:), &
-               frunoff=G%US%RZ_T_to_kg_m2s*fluxes%frunoff(:,:), sosga=sosga, geolat=G%geolatT, &
-               photo_acc_dpth=mld_pha*US%Z_to_m)
+               frunoff=G%US%RZ_T_to_kg_m2s*fluxes%frunoff(:,:), sosga=sosga)
       else
         call generic_tracer_source(US%C_to_degC*tv%T, US%S_to_ppt*tv%S, rho_dzt, dzt, dz_ml, G%isd, G%jsd, 1, dt, &
                G%US%L_to_m**2*G%areaT(:,:), get_diag_time_end(CS%diag), &
                optics%nbands, optics%max_wavelength_band, &
                sw_pen_band=G%US%QRZ_T_to_W_m2*optics%sw_pen_band(:,:,:), &
                opacity_band=G%US%m_to_Z*optics%opacity_band(:,:,:,:), &
-               frunoff=G%US%RZ_T_to_kg_m2s*fluxes%frunoff(:,:), sosga=sosga, geolat=G%geolatT, &
-               photo_acc_dpth=mld_pha*US%Z_to_m)
+               frunoff=G%US%RZ_T_to_kg_m2s*fluxes%frunoff(:,:), sosga=sosga)
       endif
     endif
 
