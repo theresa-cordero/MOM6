@@ -81,6 +81,8 @@ use MOM_SIS_set_ocean_top_stress, only:  set_ocean_top_stress_C2, set_wind_stres
 use MOM_SIS_continuity, only : summed_continuity, ice_cover_transport
 use MOM_ice_grid, only : ice_grid_type
 use MOM_domains,       only : fill_symmetric_edges
+use MOM_interface_heights,     only : find_eta
+use SIS_diag_mediator, only : enable_SIS_averaging
 
 implicit none ; private
 
@@ -379,6 +381,8 @@ subroutine step_MOM_dyn_split_RK2e(u_inst, v_inst, h, tv, visc, Time_local, dt, 
   real, dimension(SZI_(G),SZJB_(G)) :: tauy_surf_pred
   real, dimension(SZIB_(G),SZJ_(G)) :: taux_surf_corr 
   real, dimension(SZI_(G),SZJB_(G)) :: tauy_surf_corr
+  real, dimension(SZI_(G),SZJ_(G))  :: ssh_pred
+  real, dimension(SZI_(G),SZJ_(G))  :: ssh_corr
 
   real :: pres_to_eta ! A factor that converts pressures to the units of eta
                       ! [H T2 R-1 L-2 ~> m Pa-1 or kg m-2 Pa-1]
@@ -660,6 +664,13 @@ subroutine step_MOM_dyn_split_RK2e(u_inst, v_inst, h, tv, visc, Time_local, dt, 
     if (showCallTree) call callTree_wayPoint("done with continuity[BT_cont] (step_MOM_dyn_split_RK2)")
   endif
 
+  !--- SEAICE SETUP--- START ---!
+  !--- use the current ocean and sea ice velocities to set to surface stress
+  call seaice_stress(seaice, G, seaice%sG, u_inst(:,:,1), v_inst(:,:,1), taux_surf_init, tauy_surf_init)
+  !call SIS_C_dynamics(ci, mis, mice, ui, vi, uo, vo, fxat, fyat, &
+  !                        sea_lev, fxoc, fyoc, dt_slow, G, US, CS) 
+  !--- SEAICE SETUP --- END ---!
+ 
   if (CS%BT_use_layer_fluxes) then
     uh_ptr => uh_in ; vh_ptr => vh_in; u_ptr => u_inst ; v_ptr => v_inst
   endif
@@ -924,9 +935,10 @@ subroutine step_MOM_dyn_split_RK2e(u_inst, v_inst, h, tv, visc, Time_local, dt, 
 
   !--- SEAICE STEP --- START ---!
   !--- advance sea ice state using the predictor ocean velocity
-  call seaice_step(seaice, G, seaice%sG, up(:,:,1), vp(:,:,1), eta_pred, dt_pred, Time_local, taux_surf_pred, tauy_surf_pred)
-  !call SIS_C_dynamics(ci, mis, mice, ui, vi, uo, vo, fxat, fyat, &
-  !                        sea_lev, fxoc, fyoc, dt_slow, G, US, CS) 
+  call find_eta(hp, tv, G, GV, US, ssh_pred)
+  call seaice_step(seaice, G, seaice%sG, up(:,:,1), vp(:,:,1), ssh_pred, dt_pred, Time_local, taux_surf_pred, tauy_surf_pred)
+  !call seaice_stress(seaice, G, seaice%sG, up(:,:,1), vp(:,:,1), taux_surf_pred, tauy_surf_pred)
+
   !--- SEAICE STEP ---  END  ---!
 
   !--- OCEAN CORRECTOR STEP --- RK2A STYLE --- START ---!
@@ -1064,7 +1076,8 @@ subroutine step_MOM_dyn_split_RK2e(u_inst, v_inst, h, tv, visc, Time_local, dt, 
 
   !--- SEAICE STEP --- START ---!
   !--- advance sea ice state using the corrector ocean velocity
-  call seaice_step(seaice,  G, seaice%sG, u_inst(:,:,1), v_inst(:,:,1), eta, dt, Time_local, taux_surf_corr, tauy_surf_corr)
+  call find_eta(h, tv, G, GV, US, ssh_corr)
+  call seaice_step(seaice, G, seaice%sG, u_inst(:,:,1), v_inst(:,:,1), ssh_corr, dt, Time_local, taux_surf_corr, tauy_surf_corr, corrector_step=.true.)
   ! taux and tauy from this call may not be used again..... they may not be the same as taux_init next time step. 
   !call SIS_C_dynamics(ci, mis, mice, ui, vi, uo, vo, fxat, fyat, &
   !                        sea_lev, fxoc, fyoc, dt_slow, G, US, CS) 
@@ -1226,10 +1239,138 @@ subroutine step_MOM_dyn_split_RK2e(u_inst, v_inst, h, tv, visc, Time_local, dt, 
 
 end subroutine step_MOM_dyn_split_RK2e
 
-subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, time_local, taux, tauy)
+subroutine seaice_stress(DS2d, G, sG, uo, vo, taux, tauy)
   type(SIS_dyn_state_2d), pointer       :: DS2d  !< the merged sea ice state
   type(SIS_hor_grid_type),  intent(inout)         :: sG   !< The horizontal grid type
   type(ocean_grid_type),  intent(inout)         :: G   !< The horizontal grid type
+  real, dimension(SZIB_(G),SZJ_(G)), &
+                             target, intent(inout) :: uo !< Instantaneous zonal velocity [L T-1 ~> m s-1]
+  real, dimension(SZI_(G),SZJB_(G)), &
+                             target, intent(inout) :: vo !< Instantaneous meridional velocity [L T-1 ~> m s-1]
+  real, dimension(SZIB_(G),SZJ_(G)),  intent(inout) :: taux ! surface stress 
+  real, dimension(SZI_(G),SZJB_(G)),  intent(inout) :: tauy ! surface stress 
+
+  ! local
+  real, dimension(SZI_(sG),SZJ_(sG))   :: ice_cover  !< Sea ice concentration [nondim]
+  real, dimension(SZI_(sG),SZJ_(sG))   :: ice_free  !< 
+  real, dimension(SZI_(sG),SZJ_(sG))   :: mis   !< Mass per unit ocean area of sea ice,
+                                               !! snow and melt pond water [R Z ~> kg m-2]
+  real, dimension(SZIB_(sG),SZJ_(sG))  :: ui    !< Zonal ice velocity [L T-1 ~> m s-1]
+  real, dimension(SZI_(sG),SZJB_(sG))  :: vi    !< Meridional ice velocity [L T-1 ~> m s-1]
+  real, dimension(SZIB_(sG),SZJ_(sG))  :: fxat  !< Zonal air stress on ice [R Z L T-2 ~> Pa]
+  real, dimension(SZI_(sG),SZJB_(sG))  :: fyat  !< Meridional air stress on ice [R Z L T-2 ~> Pa]
+  type(unit_scale_type)              :: US    !< A structure with unit conversion factors
+  type(ice_grid_type)        :: IG   !< 
+
+  real, dimension(SZIB_(sG),SZJ_(sG))  :: &
+    WindStr_x_Cu, &   ! Zonal wind stress averaged over the ice categories on C-grid u-points [R Z L T-2 ~> Pa].
+    WindStr_x_ocn_Cu, & ! Zonal wind stress on the ice-free ocean on C-grid u-points [R Z L T-2 ~> Pa].
+    str_x_ice_ocn_Cu   ! Zonal ice-ocean stress on C-grid u-points [R Z L T-2 ~> Pa].
+  real, dimension(SZI_(sG),SZJB_(sG))  :: &
+    WindStr_y_Cv, &   ! Meridional wind stress averaged over the ice categories on C-grid v-points [R Z L T-2 ~> Pa].
+    WindStr_y_ocn_Cv, & ! Meridional wind stress on the ice-free ocean on C-grid v-points [R Z L T-2 ~> Pa].
+    str_y_ice_ocn_Cv  ! Meridional ice-ocean stress on C-grid v-points [R Z L T-2 ~> Pa].
+
+  real :: v2_at_u     ! The squared v-velocity interpolated to u points [L2 T-2 ~> m2 s-2].
+  real :: u2_at_v     ! The squared u-velocity interpolated to v points [L2 T-2 ~> m2 s-2].
+  real :: uio_init    ! Ice-ocean velocity differences [L T-1 ~> m s-1]
+  real :: vio_init    ! Ice-ocean velocity differences [L T-1 ~> m s-1]
+  real :: drag_u, drag_v ! Drag rates with the ocean at u & v points [R Z T-1 ~> kg m-2 s-1].
+  real :: cdRho       ! The ice density times the drag coefficient and rescaling factors [R Z L-1 ~> kg m-3]
+
+  real :: flux_u, flux_v, ps_ocn, ps_ice 
+  real, dimension(SZIB_(G),SZJ_(G)) :: taux_in_C ! surface stress 
+  real, dimension(SZI_(G),SZJB_(G)) :: tauy_in_C ! surface stress 
+  real :: stress_conversion
+  integer :: halo
+
+  real :: dt_slow_dyn_sec  ! The slow dynamics timestep [s].
+
+  integer :: i, j, k, ncat, isc, iec, jsc, jec
+  integer :: isd, jsd, ied, jed
+
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec ; ! ncat = sG%CatIce
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+
+  ! information passed from sea ice model to MOM6
+  ice_cover = DS2d%ice_cover ; mis = DS2d%mi_sum ;
+  ui = DS2d%u_ice_C ; vi = DS2d%v_ice_C ;
+  sG  = DS2d%sG ; US = DS2d%US; IG = DS2d%IG 
+
+  cdRho = DS2d%SIS_C_dyn_CSp%cdw * US%L_to_Z*DS2d%SIS_C_dyn_CSp%Rho_ocean
+
+  stress_conversion = US%Pa_to_RLZ_T2 ! * CS%wind_stress_multiplier
+  halo = 0 ! ; if (present(tau_halo)) halo = tau_halo
+
+  ! fxat and fyat should be added here, but really just want wind  
+  ! Correct the wind stresses for changes in the fractional ice-coverage and set
+  ! the wind stresses on the ice and the open ocean for a C-grid staggering.
+  ! This block of code must be executed if ice_cover and ice_free or the various wind
+  ! stresses were updated.
+  do j=jsd,jed ; do i=isd,ied ; ice_free(i,j) = max(1.0 - ice_cover(i,j), 0.0) ; enddo ; enddo
+  call set_wind_stresses_C(DS2d%FIA_2d, DS2d%ice_cover, ice_free, WindStr_x_Cu, WindStr_y_Cv, &
+                           WindStr_x_ocn_Cu, WindStr_y_ocn_Cv, sG, US, 1.0-1e-10)
+
+  do j=jsc,jec ; do I=isc-1,iec
+    v2_at_u =  DS2d%SIS_C_dyn_CSp%drag_bg_vel2 + 0.25 * &
+                   (((vi(i,J)-vo(i,J))**2 + (vi(i+1,J-1)-vo(i+1,J-1))**2) + &
+                    ((vi(i+1,J)-vo(i+1,J))**2 + (vi(i,J-1)-vo(i,J-1))**2))
+    uio_init = (ui(I,j)-uo(I,j))
+    drag_u = cdRho * sqrt(uio_init**2 + v2_at_u )
+    str_x_ice_ocn_Cu(I,j) = drag_u*uio_init
+  enddo ; enddo
+  do J=jsc-1,jec ; do i=isc,iec
+    u2_at_v =  DS2d%SIS_C_dyn_CSp%drag_bg_vel2 + 0.25 * &
+              (((ui(I,j)-uo(I,j))**2 + (ui(I-1,j+1)-uo(I-1,j+1))**2) + &
+               ((ui(I,j+1)-uo(I,j+1))**2 + (ui(I-1,j)-uo(I-1,j))**2))
+    vio_init = (vi(I,j)-vo(I,j))
+    drag_v = cdRho * sqrt(vio_init**2 + u2_at_v )
+    str_y_ice_ocn_Cv(I,j) = drag_v*vio_init
+  enddo ; enddo
+
+  ! Update surface forcing for the ocean 
+  taux_in_C(:,:) = 0.0 ; tauy_in_C(:,:) = 0.0
+  do j=jsc,jec ; do I=Isc-1,iec
+    ps_ocn = 1.0 ; ps_ice = 0.0
+    if (sG%mask2dCu(I,j)>0.0) then
+      ps_ocn = 0.5*(ice_free(i+1,j) + ice_free(i,j))
+      ps_ice = 0.5*(ice_cover(i+1,j) + ice_cover(i,j))
+    endif
+    flux_u = (ps_ocn * windstr_x_ocn_Cu(I,j) + ps_ice * str_x_ice_ocn_Cu(I,j))
+    taux_in_C = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*flux_u*stress_conversion
+  enddo ; enddo
+  do J=jsc-1,jec ; do i=isc,iec
+    ps_ocn = 1.0 ; ps_ice = 0.0
+    if (sG%mask2dCv(i,J)>0.0) then
+      ps_ocn = 0.5*(ice_free(i,j+1) + ice_free(i,j))
+      ps_ice = 0.5*(ice_cover(i,j+1) + ice_cover(i,j))
+    endif
+    flux_v = (ps_ocn * windstr_y_ocn_Cv(i,J) + ps_ice * str_y_ice_ocn_Cv(i,J))
+    tauy_in_C(i,J) = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*flux_v*stress_conversion
+  enddo ; enddo
+     !if (IOF%slp2ocean) then  
+     !  Ice%p_surf(i2,j2) = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*FIA%p_atm_surf(i,j) - 1e5 ! SLP - 1 std. atmosphere [Pa].
+     !else
+     !  Ice%p_surf(i2,j2) = 0.0
+     !endif
+     !Ice%p_surf(i2,j2) = Ice%p_surf(i2,j2) + US%L_T_to_m_s**2*US%m_to_Z*G%g_Earth*Ice%mi(i2,j2)
+ 
+   if (sG%symmetric) call fill_symmetric_edges(taux_in_C, tauy_in_C, sG%Domain)
+   call pass_vector(taux_in_C, tauy_in_C, sG%Domain, halo=max(1,halo))
+ 
+   do J=jsc,jec ; do i=isc-1,iec
+     taux(I,j) = sG%mask2dCu(I,j)*taux_in_C(I,j)
+   enddo ; enddo
+   do J=jsc-1,jec ; do i=isc,iec
+     tauy(i,J) = sG%mask2dCv(i,J)*tauy_in_C(i,J)
+   enddo ; enddo
+
+end subroutine seaice_stress
+
+subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, time_local, taux, tauy, corrector_step)
+  type(SIS_dyn_state_2d),    pointer        :: DS2d  !< the merged sea ice state
+  type(SIS_hor_grid_type),   intent(inout)  :: sG   !< The horizontal grid type
+  type(ocean_grid_type),     intent(inout)  :: G   !< The horizontal grid type
   real, dimension(SZIB_(G),SZJ_(G)), &
                              target, intent(inout) :: uo !< Instantaneous zonal velocity [L T-1 ~> m s-1]
   real, dimension(SZI_(G),SZJB_(G)), &
@@ -1239,14 +1380,19 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, time_local, taux, tauy
   real,                              intent(in) :: dt_slow !< The amount of time over which the ice
                                                               !! dynamics are to be advanced [T ~> s].
   type(time_type) :: Time_local
-  real, dimension(SZIB_(G),SZJ_(G)),  intent(inout) :: taux ! surface stress 
-  real, dimension(SZI_(G),SZJB_(G)),  intent(inout) :: tauy ! surface stress 
+  real, dimension(SZIB_(sG),SZJ_(sG)), intent(inout) :: taux ! surface stress 
+  real, dimension(SZI_(sG),SZJB_(sG)), intent(inout) :: tauy ! surface stress 
+  logical,  optional,                  intent(in) :: corrector_step  
 
   ! local
   real, dimension(SZI_(sG),SZJ_(sG))   :: ice_cover  !< Sea ice concentration [nondim]
   real, dimension(SZI_(sG),SZJ_(sG))   :: ice_free  !< 
   real, dimension(SZI_(sG),SZJ_(sG))   :: mis   !< Mass per unit ocean area of sea ice,
-                                               !! snow and melt pond water [R Z ~> kg m-2]
+                                                !! snow and melt pond water [R Z ~> kg m-2]
+  real, dimension(SZI_(sG),SZJ_(sG))   :: mis_out !< Mass per unit ocean area of sea ice,
+                                                !! snow and melt pond water [R Z ~> kg m-2]
+  real, dimension(SZIB_(sG),SZJ_(sG))  :: uh_step !< Total mass flux  
+  real, dimension(SZI_(sG),SZJB_(sG))  :: vh_step !< Total mass flux
   real, dimension(SZI_(sG),SZJ_(sG))   :: mice  !< Mass per unit ocean area of sea ice [R Z ~> kg m-2]
   real, dimension(SZIB_(sG),SZJ_(sG))  :: ui    !< Zonal ice velocity [L T-1 ~> m s-1]
   real, dimension(SZI_(sG),SZJB_(sG))  :: vi    !< Meridional ice velocity [L T-1 ~> m s-1]
@@ -1278,6 +1424,7 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, time_local, taux, tauy
   integer :: halo
 
   real :: dt_slow_dyn_sec  ! The slow dynamics timestep [s].
+  logical :: corr_step
 
   integer :: i, j, k, ncat, isc, iec, jsc, jec
   integer :: isd, jsd, ied, jed
@@ -1289,15 +1436,18 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, time_local, taux, tauy
   ice_cover = DS2d%ice_cover ; mis = DS2d%mi_sum ; mice = DS2d%mi_sum ;
   ui = DS2d%u_ice_C ; vi = DS2d%v_ice_C ;
   sG  = DS2d%sG ; US = DS2d%US; IG = DS2d%IG 
+  mis_out = 0.0
 
   stress_conversion = US%Pa_to_RLZ_T2 ! * CS%wind_stress_multiplier
   halo = 0 ! ; if (present(tau_halo)) halo = tau_halo
 
   dt_slow_dyn_sec = US%T_to_s*dt_slow
 
+  corr_step = .false.   
+  if (present(corrector_step)) corr_step = corrector_step
 
-  ! Are eta and sea level the same?
-  ! Assuming yes for now, correction will go here if not.
+  call enable_SIS_averaging(dt_slow, Time_local, DS2d%SIS_C_dyn_CSp%diag)
+  !call enable_averages(dt_slow, Time_local, DS2d%SIS_C_dyn_CSp%diag)
 
   ! fxat and fyat should be added here, but really just want wind  
   ! Correct the wind stresses for changes in the fractional ice-coverage and set
@@ -1305,21 +1455,23 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, time_local, taux, tauy
   ! This block of code must be executed if ice_cover and ice_free or the various wind
   ! stresses were updated.
   do j=jsd,jed ; do i=isd,ied ; ice_free(i,j) = max(1.0 - ice_cover(i,j), 0.0) ; enddo ; enddo
-  call set_wind_stresses_C(DS2d%FIA_2d, DS2d%ice_cover, ice_free, WindStr_x_Cu, WindStr_y_Cv, &
+  call set_wind_stresses_C(DS2d%FIA_2d, ice_cover, ice_free, WindStr_x_Cu, WindStr_y_Cv, &
                            WindStr_x_ocn_Cu, WindStr_y_ocn_Cv, sG, US, 1.0-1e-10)
-  ! this routine still needs to be moved to MOM
 
+  !chksum_vec_C3d(mesg, u_comp, v_comp, G, halos, scalars, unscale)
+  !uvchksum(mesg, u_comp, v_comp, G%HI, halos, scale=unscale)
+    !call uvchksum("Corrector avg [uv]", u_av, v_av, G%HI, haloshift=1, symmetric=sym, unscale=US%L_T_to_m_s)
   !if (CS%debug) then
-  !  call uvchksum("Before SIS_C_dynamics [uv]_ice_C", DS2d%u_ice_C, DS2d%v_ice_C, sG, scale=US%L_T_to_m_s)
-  !  call hchksum(ice_free, "ice_free before SIS_C_dynamics", sG%HI)
-  !  !call hchksum(DS2d%mca_step(:,:,DS2d%nts), "misp_sum before SIS_C_dynamics", G%HI, scale=US%RZ_to_kg_m2)
-  !  call hchksum(DS2d%mi_sum, "mi_sum before SIS_C_dynamics", sG%HI, scale=US%RZ_to_kg_m2)
-  !  call hchksum(OSS%sea_lev, "sea_lev before SIS_C_dynamics", sG%HI, haloshift=1, scale=US%Z_to_m)
-  !  call hchksum(DS2d%ice_cover, "ice_cover before SIS_C_dynamics", sG%HI, haloshift=1)
-  !  call uvchksum("[uv]_ocn before SIS_C_dynamics", uo, vo, sG, halos=1, scale=US%L_T_to_m_s)
-  !  call uvchksum("WindStr_[xy] before SIS_C_dynamics", WindStr_x_Cu, WindStr_y_Cv, sG, &
-  !                halos=1, scale=US%RZ_T_to_kg_m2s*US%L_T_to_m_s)
-!    call hchksum_pair("WindStr_[xy]_A before SIS_C_dynamics", WindStr_x_A, WindStr_y_A, G, halos=1)
+    call uvchksum("Before SIS_C_dynamics [uv]_ice_C", ui, vi, G%HI, haloshift=0, unscale=US%L_T_to_m_s)
+    call hchksum(ice_free, "ice_free before SIS_C_dynamics", G%HI)
+    !call hchksum(DS2d%mca_step(:,:,DS2d%nts), "misp_sum before SIS_C_dynamics", G%HI, scale=US%RZ_to_kg_m2)
+    call hchksum(DS2d%mi_sum, "mi_sum before SIS_C_dynamics",  G%HI, haloshift=0, unscale=US%RZ_to_kg_m2)
+    call hchksum(eta, "sea_lev before SIS_C_dynamics", G%HI, haloshift=1, unscale=US%Z_to_m)
+    call hchksum(DS2d%ice_cover,"ice_cover before SIS_C_dynamics", G%HI, haloshift=1)
+    call uvchksum("[uv]_ocn before SIS_C_dynamics", uo, vo, G%HI, haloshift=0, unscale=US%L_T_to_m_s)
+    call uvchksum("WindStr_[xy] before SIS_C_dynamics", WindStr_x_Cu, WindStr_y_Cv, G%HI, &
+                  haloshift=1, unscale=US%RZ_T_to_kg_m2s*US%L_T_to_m_s)
+    !call hchksum_pair("WindStr_[xy]_A before SIS_C_dynamics", WindStr_x_A, WindStr_y_A, G, halos=1)
   !endif
 
   !if (nds>1) &
@@ -1329,18 +1481,31 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, time_local, taux, tauy
   !### Ridging needs to be added with C-grid dynamics.
   !call SIS_C_dynamics(ci, mis, mice, ui, vi, uo, vo, fxat, fyat, &
   !                        sea_lev, fxoc, fyoc, dt_slow, G, US, CS)
-  !call SIS_C_dynamics(ice_cover, DS2d%mca_step(:,:,DS2d%nts), mi_sum, &
-  call SIS_C_dynamics(ice_cover, mis, mice, &
-                      ui, vi, &
-                      uo, vo, WindStr_x_Cu, WindStr_y_Cv, eta, &
-                      str_x_ice_ocn_Cu, str_y_ice_ocn_Cv, dt_slow, sG, US, DS2d%SIS_C_dyn_CSp)
-
+  call SIS_C_dynamics(ice_cover, mis, mice, ui, vi, uo, vo, WindStr_x_Cu, WindStr_y_Cv, &
+                      eta, str_x_ice_ocn_Cu, str_y_ice_ocn_Cv, dt_slow, sG, US, DS2d%SIS_C_dyn_CSp, &
+                      corrector_step=corr_step)
   !call cpu_clock_end(iceClocka)
 
-  !if (CS%debug) call uvchksum("After ice_dynamics [uv]_ice_C", DS2d%u_ice_C, DS2d%v_ice_C, G, scale=US%L_T_to_m_s)
+  !if (corr_step) then
+  !  call SIS_C_dyn_diags(ice_cover, mis, mice, ui, vi, uo, vo, WindStr_x_Cu, WindStr_y_Cv, &
+  !                      eta, str_x_ice_ocn_Cu, str_y_ice_ocn_Cv, dt_slow, sG, US, DS2d%SIS_C_dyn_CSp)
+  !endif
+  !call cpu_clock_end(iceClocka)
+  !if (CS%debug) then
+    call uvchksum("After SIS_C_dynamics [uv]_ice_C", ui, vi, G%HI, haloshift=0, unscale=US%L_T_to_m_s)
+    call hchksum(ice_free, "ice_free after SIS_C_dynamics", G%HI)
+    !call hchksum(DS2d%mca_step(:,:,DS2d%nts), "misp_sum after SIS_C_dynamics", G%HI, scale=US%RZ_to_kg_m2)
+    call hchksum(DS2d%mi_sum, "mi_sum after SIS_C_dynamics",  G%HI, haloshift=0, unscale=US%RZ_to_kg_m2)
+    call hchksum(eta, "sea_lev after SIS_C_dynamics", G%HI, haloshift=1, unscale=US%Z_to_m)
+    call hchksum(DS2d%ice_cover,"ice_cover after SIS_C_dynamics", G%HI, haloshift=1)
+    call uvchksum("[uv]_ocn after SIS_C_dynamics", uo, vo, G%HI, haloshift=0, unscale=US%L_T_to_m_s)
+    call uvchksum("WindStr_[xy] after SIS_C_dynamics", WindStr_x_Cu, WindStr_y_Cv, G%HI, &
+                  haloshift=1, unscale=US%RZ_T_to_kg_m2s*US%L_T_to_m_s)
+    !call hchksum_pair("WindStr_[xy]_A before SIS_C_dynamics", WindStr_x_A, WindStr_y_A, G, halos=1)
+  !endif
 
   !call cpu_clock_begin(iceClockb)
-  call pass_vector(DS2d%u_ice_C, DS2d%v_ice_C, sG%Domain, stagger=CGRID_NE)
+  call pass_vector(ui, vi, sG%Domain, stagger=CGRID_NE)
   call pass_vector(str_x_ice_ocn_Cu, str_y_ice_ocn_Cv, sG%Domain, stagger=CGRID_NE)
   !call cpu_clock_end(iceClockb)
 
@@ -1352,86 +1517,88 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, time_local, taux, tauy
   !                            DS2d%u_ice_C, DS2d%v_ice_C, G, scale=US%L_T_to_m_s)
 
   ! Store all mechanical ocean forcing.
-  !call set_ocean_top_stress_C2(IOF, WindStr_x_ocn_Cu, WindStr_y_ocn_Cv, &
+  ! call set_ocean_top_stress_C2(IOF, WindStr_x_ocn_Cu, WindStr_y_ocn_Cv, &
   !                             str_x_ice_ocn_Cu, str_y_ice_ocn_Cv, ice_free, DS2d%ice_cover, G, US, OBC)
   ! Update surface forcing for the ocean 
   ! taux = ps_ocn*WindStr_x_ocn_Cu + ps_ice*str_x_ice_ocn_Cu
-       taux_in_C(:,:) = 0.0 ; tauy_in_C(:,:) = 0.0
-      do j=jsc,jec ; do I=Isc-1,iec
-        ps_ocn = 1.0 ; ps_ice = 0.0
-        if (sG%mask2dCu(I,j)>0.0) then
-          ps_ocn = 0.5*(ice_free(i+1,j) + ice_free(i,j))
-          ps_ice = 0.5*(ice_cover(i+1,j) + ice_cover(i,j))
-        endif
-        flux_u = (ps_ocn * windstr_x_ocn_Cu(I,j) + ps_ice * str_x_ice_ocn_Cu(I,j))
-        taux_in_C = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*flux_u*stress_conversion
-      enddo ; enddo
-      do J=jsc-1,jec ; do i=isc,iec
-        ps_ocn = 1.0 ; ps_ice = 0.0
-        if (sG%mask2dCv(i,J)>0.0) then
-          ps_ocn = 0.5*(ice_free(i,j+1) + ice_free(i,j))
-          ps_ice = 0.5*(ice_cover(i,j+1) + ice_cover(i,j))
-        endif
-        flux_v = (ps_ocn * windstr_y_ocn_Cv(i,J) + ps_ice * str_y_ice_ocn_Cv(i,J))
-        tauy_in_C(i,J) = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*flux_v*stress_conversion
-      enddo ; enddo
-         !if (IOF%slp2ocean) then  
-         !  Ice%p_surf(i2,j2) = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*FIA%p_atm_surf(i,j) - 1e5 ! SLP - 1 std. atmosphere [Pa].
-         !else
-         !  Ice%p_surf(i2,j2) = 0.0
-         !endif
-         !Ice%p_surf(i2,j2) = Ice%p_surf(i2,j2) + US%L_T_to_m_s**2*US%m_to_Z*G%g_Earth*Ice%mi(i2,j2)
+  taux_in_C(:,:) = 0.0 ; tauy_in_C(:,:) = 0.0
+  do j=jsc,jec ; do I=Isc-1,iec
+    ps_ocn = 1.0 ; ps_ice = 0.0
+    if (sG%mask2dCu(I,j)>0.0) then
+      ps_ocn = 0.5*(ice_free(i+1,j) + ice_free(i,j))
+      ps_ice = 0.5*(ice_cover(i+1,j) + ice_cover(i,j))
+    endif
+    !flux_u = (ps_ocn * windstr_x_ocn_Cu(I,j) + ps_ice * str_x_ice_ocn_Cu(I,j))
+    !taux_in_C = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*flux_u*stress_conversion
+    taux_in_C(I,j) = (ps_ocn * windstr_x_ocn_Cu(I,j) + ps_ice * str_x_ice_ocn_Cu(I,j))
+  enddo ; enddo
+  do J=jsc-1,jec ; do i=isc,iec
+    ps_ocn = 1.0 ; ps_ice = 0.0
+    if (sG%mask2dCv(i,J)>0.0) then
+      ps_ocn = 0.5*(ice_free(i,j+1) + ice_free(i,j))
+      ps_ice = 0.5*(ice_cover(i,j+1) + ice_cover(i,j))
+    endif
+    !flux_v = (ps_ocn * windstr_y_ocn_Cv(i,J) + ps_ice * str_y_ice_ocn_Cv(i,J))
+    !tauy_in_C(i,J) = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*flux_v*stress_conversion
+    tauy_in_C(i,J) = (ps_ocn * windstr_y_ocn_Cv(i,J) + ps_ice * str_y_ice_ocn_Cv(i,J))
+  enddo ; enddo
+  !if (IOF%slp2ocean) then  
+  !  Ice%p_surf(i2,j2) = US%RZ_T_to_kg_m2s*US%L_T_to_m_s*FIA%p_atm_surf(i,j) - 1e5 ! SLP - 1 std. atmosphere [Pa].
+  !else
+  !  Ice%p_surf(i2,j2) = 0.0
+  !endif
+  !Ice%p_surf(i2,j2) = Ice%p_surf(i2,j2) + US%L_T_to_m_s**2*US%m_to_Z*G%g_Earth*Ice%mi(i2,j2)
  
-       if (sG%symmetric) call fill_symmetric_edges(taux_in_C, tauy_in_C, sG%Domain)
-       call pass_vector(taux_in_C, tauy_in_C, sG%Domain, halo=max(1,halo))
+  if (sG%symmetric) call fill_symmetric_edges(taux_in_C, tauy_in_C, sG%Domain)
+  call pass_vector(taux_in_C, tauy_in_C, sG%Domain, halo=max(1,halo))
  
-       do J=jsc,jec ; do i=isc-1,iec
-         taux(I,j) = sG%mask2dCu(I,j)*taux_in_C(I,j)
-       enddo ; enddo
-       do J=jsc-1,jec ; do i=isc,iec
-         tauy(i,J) = sG%mask2dCv(i,J)*tauy_in_C(i,J)
-       enddo ; enddo
-   !---- simplify this block and make sure all the variables are there. 
+  do J=jsc,jec ; do i=isc-1,iec
+    taux(I,j) = sG%mask2dCu(I,j)*taux_in_C(I,j)
+  enddo ; enddo
+  do J=jsc-1,jec ; do i=isc,iec
+    tauy(i,J) = sG%mask2dCv(i,J)*tauy_in_C(i,J)
+  enddo ; enddo
+  !---- simplify this block and make sure all the variables are there. 
 
   !call cpu_clock_end(iceClockc)  
 
-   ! if (CS%do_ridging) then ! Accumulate the time-average ridging rate.
-   !   DS2d%ridge_rate_count = DS2d%ridge_rate_count + 1.
-   !   wt_new = 1.0 / DS2d%ridge_rate_count ; wt_prev = 1.0 - wt_new
-   !   do j=jsc,jec ; do i=isc,iec
-   !     DS2d%avg_ridge_rate(i,j) = wt_new * rdg_rate(i,j) + wt_prev * DS2d%avg_ridge_rate(i,j)
-   !   enddo ; enddo
-   ! endif
+  ! if (CS%do_ridging) then ! Accumulate the time-average ridging rate.
+  !   DS2d%ridge_rate_count = DS2d%ridge_rate_count + 1.
+  !   wt_new = 1.0 / DS2d%ridge_rate_count ; wt_prev = 1.0 - wt_new
+  !   do j=jsc,jec ; do i=isc,iec
+  !     DS2d%avg_ridge_rate(i,j) = wt_new * rdg_rate(i,j) + wt_prev * DS2d%avg_ridge_rate(i,j)
+  !   enddo ; enddo
+  ! endif
 
-   ! if (CS%debug) call uvchksum("Before ice_transport [uv]_ice_C", DS2d%u_ice_C, DS2d%v_ice_C, sG, scale=US%L_T_to_m_s)
-   !  call enable_SIS_averaging(dt_slow_dyn_sec, Time_local + real_to_time(nds*dt_slow_dyn_sec), CS%diag)
+  ! if (CS%debug) call uvchksum("Before ice_transport [uv]_ice_C", DS2d%u_ice_C, DS2d%v_ice_C, sG, scale=US%L_T_to_m_s)
+  !  call enable_SIS_averaging(dt_slow_dyn_sec, Time_local + real_to_time(nds*dt_slow_dyn_sec), CS%diag)
 
-    ! Update the integrated ice mass and store the transports in each step.
-    !if (DS2d%nts+CS%adv_substeps > DS2d%max_nts) &
-    !  call increase_max_tracer_step_memory(DS2d, sG, DS2d%nts+CS%adv_substeps)
-    !if (DS2d%nts+1 > DS2d%max_nts) &
-    !  call increase_max_tracer_step_memory(DS2d, sG, DS2d%nts+1)
+  ! Update the integrated ice mass and store the transports in each step.
+  !if (DS2d%nts+CS%adv_substeps > DS2d%max_nts) &
+  !  call increase_max_tracer_step_memory(DS2d, sG, DS2d%nts+CS%adv_substeps)
+  !if (DS2d%nts+1 > DS2d%max_nts) &
+  !  call increase_max_tracer_step_memory(DS2d, sG, DS2d%nts+1)
 
-    !do n = DS2d%nts+1, DS2d%nts+CS%adv_substeps
-    !  if ((n < ndyn_steps*CS%adv_substeps) .or. continuing_call) then
-        ! Some of the work is not needed for the last step before cat_ice_transport.
-        call summed_continuity(DS2d%u_ice_C, DS2d%v_ice_C, DS2d%mca_step(:,:,0), DS2d%mca_step(:,:,1), &
-                               DS2d%uh_step(:,:,1), DS2d%vh_step(:,:,1), dt_slow, sG, US, IG, &
-                               DS2d%dynmer_trans_CSp%continuity_CSp, h_ice=DS2d%mi_sum)
-        call ice_cover_transport(DS2d%u_ice_C, DS2d%v_ice_C, DS2d%ice_cover, dt_slow, sG, US, IG, DS2d%dynmer_trans_CSp%cover_trans_CSp, &
-                                 masking_uhtot=DS2d%uh_step(:,:,1), masking_vhtot=DS2d%vh_step(:,:,1))
-        call pass_var(DS2d%mi_sum, sG%Domain, complete=.false.)
-        call pass_var(DS2d%ice_cover, sG%Domain, complete=.false.)
-        call pass_var(DS2d%mca_step(:,:,1), sG%Domain, complete=.true.)
-    !  else
-    !   call summed_continuity(DS2d%u_ice_C, DS2d%v_ice_C, DS2d%mca_step(:,:,n-1), DS2d%mca_step(:,:,n), &
-    !                           DS2d%uh_step(:,:,n), DS2d%vh_step(:,:,n), dt_adv, sG, US, IG, CS%continuity_CSp)
-    !  endif
-    ! enddo
-    !DS2d%nts = DS2d%nts + CS%adv_substeps
-    !call cpu_clock_end(iceClock4)
+  ! Some of the work is not needed for the last step before cat_ice_transport.
+  ! call summed_continuity(DS2d%u_ice_C, DS2d%v_ice_C, DS2d%mca_step(:,:,0), DS2d%mca_step(:,:,1), &
+  call summed_continuity(ui, vi, mis, mis_out, &
+                         uh_step, vh_step, dt_slow, sG, US, IG, &
+                         DS2d%dynmer_trans_CSp%continuity_CSp, h_ice=mice)
+  call ice_cover_transport(ui, vi, ice_cover, dt_slow, sG, US, IG, DS2d%dynmer_trans_CSp%cover_trans_CSp, &
+                           masking_uhtot=uh_step, masking_vhtot=vh_step)
+  call pass_var(mice, sG%Domain, complete=.false.)
+  call pass_var(ice_cover, sG%Domain, complete=.false.)
+  call pass_var(mis_out, sG%Domain, complete=.true.)
+  !call cpu_clock_end(iceClock4)
 
   ! convert updated ui and vi to an updated stress MOM6 would expect
+  ! done above?
+
+  ! Update vars 
+  if (corr_step) then
+    DS2d%ice_cover = ice_cover ; DS2d%mi_sum = mis; DS2d%mi_sum = mice ;
+    DS2d%u_ice_C = ui ; DS2d%v_ice_C = vi;
+  endif
  
 end subroutine seaice_step
 

@@ -42,6 +42,7 @@ use user_revise_forcing,  only : user_revise_forcing_CS
 
 use MOM_barotropic,       only : Barotropic_CS
 use MOM_SIS_dyn_types,    only : SIS_dyn_state_2d
+use MOM_safe_alloc,       only : safe_alloc=>safe_alloc_alloc
 
 use iso_fortran_env, only : int64
 
@@ -1335,9 +1336,9 @@ subroutine forcing_save_restart(CS, G, Time, directory, time_stamped, &
 end subroutine forcing_save_restart
 
 !> Initialize the surface forcing, including setting parameters and allocating permanent memory.
-subroutine seaice_init(G, CS)
-  type(ocean_grid_type),    intent(in)    :: G    !< The ocean's grid structure
-  type(SIS_dyn_state_2d), pointer       :: CS   !< A pointer that is set to point to the control
+subroutine seaice_init(G, DS2d)
+  type(ocean_grid_type),  intent(in)    :: G    !< The ocean's grid structure
+  type(SIS_dyn_state_2d), pointer       :: DS2d   !< A pointer that is set to point to the control
 
   ! Local variables
   integer :: i, j, isd, ied, jsd, jed
@@ -1346,32 +1347,53 @@ subroutine seaice_init(G, CS)
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
   isdB = G%isdB ; iedB = G%iedB ; jsdB = G%jsdB ; jedB = G%jedB
 
-  !if dyn/merged ice
-    if (.not.associated(CS)) allocate(CS)
-    allocate( CS%mi_sum(isd:ied,jsd:jed) )
-    allocate( CS%ice_cover(isd:ied,jsd:jed))
-    allocate( CS%u_ice_C(IsdB:IedB,jsd:jed))
-    allocate( CS%v_ice_C(isd:ied,JsdB:JedB))
-    allocate( CS%uh_step(IsdB:IedB,jsd:jed,1)) ! !! third dim here needs to be number of seice timesteps??
-    allocate( CS%vh_step(isd:ied,JsdB:JedB,1)) !
-    allocate( CS%mca_step(isd:ied,jsd:jed,2))  ! 
-    ! only needed for embedded/semiembedded coupling
-    if (.not.associated(CS%FIA_2d)) allocate(CS%FIA_2d)
-    allocate( CS%FIA_2d%ice_cover(isd:ied,jsd:jed))
-    allocate( CS%FIA_2d%ice_free(isd:ied,jsd:jed))
-    allocate( CS%FIA_2d%WindStr_x(IsdB:IedB,jsd:jed))
-    allocate( CS%FIA_2d%WindStr_y(isd:ied,JsdB:JedB))
-    allocate( CS%FIA_2d%WindStr_ocn_x(IsdB:IedB,jsd:jed))
-    allocate( CS%FIA_2d%WindStr_ocn_y(isd:ied,JsdB:JedB))
-    if (.not.associated(CS%dynmer_trans_CSp)) allocate(CS%dynmer_trans_CSp)
-    if (.not.associated(CS%dynmer_trans_CSp%diag)) allocate(CS%dynmer_trans_CSp%diag)
-    if (.not.associated(CS%dynmer_trans_CSp%continuity_CSp)) allocate(CS%dynmer_trans_CSp%continuity_CSp )
-    if (.not.associated(CS%dynmer_trans_CSp%cover_trans_CSp)) allocate(CS%dynmer_trans_CSp%cover_trans_CSp)
-    if (.not.associated(CS%SIS_C_dyn_CSp)) allocate(CS%SIS_C_dyn_CSp)
-    if (.not.associated(CS%sG)) allocate(CS%sG)
-    if (.not.associated(CS%US)) allocate(CS%US)
-    if (.not.associated(CS%IG)) allocate(CS%IG)
-  !endif  
+  if (.not.associated(DS2d)) allocate(DS2d)
+  DS2d%ridge_rate_count = 0.
+  !if (CS%do_ridging) call safe_alloc(DS2d%avg_ridge_rate, G%isd, G%ied, G%jsd, G%jed)
+
+  !if (CS%merged_cont) then
+  DS2d%nts = 0 ; DS2d%max_nts = 0
+  call safe_alloc(DS2d%mi_sum, G%isd, G%ied, G%jsd, G%jed)
+  call safe_alloc(DS2d%ice_cover, G%isd, G%ied, G%jsd, G%jed)
+  !max_nts = CS%adv_substeps
+  !if ((CS%dt_ice_dyn > 0.0) .and. (CS%dt_advect > CS%dt_ice_dyn)) &
+  !  max_nts = CS%adv_substeps * max(CEILING(CS%dt_advect/CS%dt_ice_dyn - 1e-6), 1)
+  !call increase_max_tracer_step_memory(CS%DS2d, G, max_nts)
+
+  call safe_alloc(DS2d%u_ice_C, G%IsdB, G%IedB, G%jsd, G%jed)
+  call safe_alloc(DS2d%v_ice_C, G%isd, G%ied, G%JsdB, G%JedB)
+
+  !call safe_alloc(DS2d%uh_step, G%IsdB, G%IedB, G%jsd, G%jed)
+  !call safe_alloc(DS2d%vh_step, G%isd, G%ied, G%JsdB, G%JedB)
+  !call safe_alloc(DS2d%mca_step, G%isd, G%ied, G%jsd, G%jed)
+  ! only needed for embedded/semiembedded coupling
+  if (.not.associated(DS2d%FIA_2d)) allocate(DS2d%FIA_2d)
+  call safe_alloc(DS2d%FIA_2d%ice_cover, G%Isd, G%Ied, G%jsd, G%jed)
+  call safe_alloc(DS2d%FIA_2d%ice_free,  G%Isd, G%Ied, G%jsd, G%jed)
+  call safe_alloc(DS2d%FIA_2d%WindStr_x, G%IsdB, G%IedB, G%jsd, G%jed)
+  call safe_alloc(DS2d%FIA_2d%WindStr_y, G%isd, G%ied, G%JsdB, G%JedB)
+  call safe_alloc(DS2d%FIA_2d%WindStr_ocn_x, G%IsdB, G%IedB, G%jsd, G%jed)
+  call safe_alloc(DS2d%FIA_2d%WindStr_ocn_y, G%isd, G%ied, G%JsdB, G%JedB)
+  if (.not.associated(DS2d%dynmer_trans_CSp)) allocate(DS2d%dynmer_trans_CSp)
+  DS2d%dynmer_trans_CSp%debug = .true.
+  DS2d%dynmer_trans_CSp%do_ridging = .false.
+  if (.not.associated(DS2d%dynmer_trans_CSp%diag)) allocate(DS2d%dynmer_trans_CSp%diag)
+  !DS2d%dynmer_trans_CSp%diag = CS%diag
+  if (.not.associated(DS2d%dynmer_trans_CSp%continuity_CSp)) allocate(DS2d%dynmer_trans_CSp%continuity_CSp )
+  !DS2d%dynmer_trans_CSp%continuity_CSp = CS%continuity_CSp
+  if (.not.associated(DS2d%dynmer_trans_CSp%cover_trans_CSp)) allocate(DS2d%dynmer_trans_CSp%cover_trans_CSp)
+  !DS2d%dynmer_trans_CSp%cover_trans_CSp = CS%cover_trans_CSp
+  !CS%DS2d%SIS_C_dyn_CSp => CS%SIS_C_dyn_CSp
+  !! if (.not.associated(DS2d%SIS_C_dyn_CSp)) allocate(DS2d%SIS_C_dyn_CSp)
+  !! DS2d%SIS_C_dyn_CSp = CS%SIS_C_dyn_CSp
+  if (.not.associated(DS2d%sG)) allocate(DS2d%sG)
+  !DS2d%sG = G
+  if (.not.associated(DS2d%US)) allocate(DS2d%US)
+  !DS2d%US = US
+  if (.not.associated(DS2d%IG)) allocate(DS2d%IG)
+  ! DS2d%IG = IG
+  ! only needed for embedded/semiembedded coupling
+
 end subroutine seaice_init
 
 !> Initialize the surface forcing, including setting parameters and allocating permanent memory.
