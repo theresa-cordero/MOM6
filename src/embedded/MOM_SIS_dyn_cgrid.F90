@@ -641,8 +641,10 @@ subroutine SIS_C_dynamics(ci, mis, mice, ui, vi, uo, vo, fxat, fyat, &
   logical :: do_trunc_its  ! If true, overly large velocities in the iterations are truncated.
   integer :: halo_sh_Ds  ! The halo size that can be used in calculating sh_Ds.
   integer :: i, j, isc, iec, jsc, jec, n
+  integer :: isd, ied, jsd, jed
   logical :: corr_step
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
   corr_step = .false.   
   if (present(corrector_step)) corr_step = corrector_step
@@ -1101,7 +1103,6 @@ subroutine SIS_C_dynamics(ci, mis, mice, ui, vi, uo, vo, fxat, fyat, &
                (mi_u(I,j) + m_neglect + dt * (drag_u + drag_LFu))
 
       ui(I,j) = (uio_C + uo(I,j)) * G%mask2dCu(I,j)
-      call uvchksum("[uv]i in SIS_C_dynamics", ui, vi, G, scale=US%L_T_to_m_s)
 
       ! Note that fxoc is the stress felt by the ocean.
       fxoc(I,j) = fxoc(I,j) + drag_u*uio_C
@@ -1266,10 +1267,10 @@ subroutine SIS_C_dynamics(ci, mis, mice, ui, vi, uo, vo, fxat, fyat, &
     endif
 
     if (CS%debug_EVP .and. CS%debug) then
-      call hchksum(CS%str_d, "str_d in SIS_C_dynamics", G%HI, haloshift=1, scale=US%RZ_to_kg_m2*US%L_T_to_m_s**2)
-      call hchksum(CS%str_t, "str_t in SIS_C_dynamics", G%HI, haloshift=1, scale=US%RZ_to_kg_m2*US%L_T_to_m_s**2)
-      call Bchksum(CS%str_s, "str_s in SIS_C_dynamics", G%HI, &
-                   haloshift=0, symmetric=.true., scale=US%RZ_to_kg_m2*US%L_T_to_m_s**2)
+    !  call hchksum(CS%str_d, "str_d in SIS_C_dynamics", G%HI, haloshift=1, scale=US%RZ_to_kg_m2*US%L_T_to_m_s**2)
+    !  call hchksum(CS%str_t, "str_t in SIS_C_dynamics", G%HI, haloshift=1, scale=US%RZ_to_kg_m2*US%L_T_to_m_s**2)
+    !  call Bchksum(CS%str_s, "str_s in SIS_C_dynamics", G%HI, &
+    !               haloshift=0, symmetric=.true., scale=US%RZ_to_kg_m2*US%L_T_to_m_s**2)
     endif
     if (CS%debug_EVP .and. (CS%debug .or. CS%debug_redundant)) then
       call uvchksum("[uv]i in SIS_C_dynamics", ui, vi, G, scale=US%L_T_to_m_s)

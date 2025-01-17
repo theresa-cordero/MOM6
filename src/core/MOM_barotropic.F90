@@ -317,6 +317,7 @@ type, public :: barotropic_CS ;  ! private
   !>@{ Diagnostic IDs
   integer :: id_PFu_bt = -1, id_PFv_bt = -1, id_Coru_bt = -1, id_Corv_bt = -1
   integer :: id_ubtforce = -1, id_vbtforce = -1, id_uaccel = -1, id_vaccel = -1
+  integer :: id_ubtforcetaux = -1, id_vbtforcetauy = -1
   integer :: id_visc_rem_u = -1, id_visc_rem_v = -1, id_eta_cor = -1
   integer :: id_ubt = -1, id_vbt = -1, id_eta_bt = -1, id_ubtav = -1, id_vbtav = -1
   integer :: id_ubt_st = -1, id_vbt_st = -1, id_eta_st = -1
@@ -567,6 +568,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                   ! bt_rem_u is between 0 and 1.
     BT_force_u, & ! The vertical average of all of the u-accelerations that are
                   ! not explicitly included in the barotropic equation [L T-2 ~> m s-2].
+    BT_force_taux, & ! 
+                  !
     u_accel_bt, & ! The difference between the zonal acceleration from the
                   ! barotropic calculation and BT_force_u [L T-2 ~> m s-2].
     uhbt, &       ! The zonal barotropic thickness fluxes [H L2 T-1 ~> m3 s-1 or kg s-1].
@@ -598,6 +601,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
                   ! drag [nondim].  bt_rem_v is between 0 and 1.
     BT_force_v, & ! The vertical average of all of the v-accelerations that are
                   ! not explicitly included in the barotropic equation [L T-2 ~> m s-2].
+    BT_force_tauy, & ! 
+                  !
     v_accel_bt, & ! The difference between the meridional acceleration from the
                   ! barotropic calculation and BT_force_v [L T-2 ~> m s-2].
     vhbt, &       ! The meridional barotropic thickness fluxes [H L2 T-1 ~> m3 s-1 or kg s-1].
@@ -1339,11 +1344,14 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
     if (present(taux_surf)) then
       BT_force_u(I,j) = taux_surf(I,j) * GV%RZ_to_H * CS%IDatu(I,j)*visc_rem_u(I,j,1)
+      BT_force_taux(I,j) = taux_surf(I,j) * GV%RZ_to_H * CS%IDatu(I,j)*visc_rem_u(I,j,1)
     else
       BT_force_u(I,j) = forces%taux(I,j) * GV%RZ_to_H * CS%IDatu(I,j)*visc_rem_u(I,j,1)
+      BT_force_taux(I,j) = forces%taux(I,j) * GV%RZ_to_H * CS%IDatu(I,j)*visc_rem_u(I,j,1)
     endif
   else
     BT_force_u(I,j) = 0.0
+    BT_force_taux(I,j) = 0.0
   endif ; enddo ; enddo
   !$OMP parallel do default(shared)
   do J=js-1,je ; do i=is,ie ; if (G%mask2dCv(i,J) > 0.0) then
@@ -1369,11 +1377,14 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
     if (present(tauy_surf)) then
       BT_force_v(i,J) = tauy_surf(i,J) * GV%RZ_to_H * CS%IDatv(i,J)*visc_rem_v(i,J,1)
+      BT_force_tauy(i,J) = tauy_surf(i,J) * GV%RZ_to_H * CS%IDatv(i,J)*visc_rem_v(i,J,1)
     else
       BT_force_v(i,J) = forces%tauy(i,J) * GV%RZ_to_H * CS%IDatv(i,J)*visc_rem_v(i,J,1)
+      BT_force_tauy(i,J) = forces%tauy(i,J) * GV%RZ_to_H * CS%IDatv(i,J)*visc_rem_v(i,J,1)
     endif
   else
     BT_force_v(i,J) = 0.0
+    BT_force_tauy(i,J) = 0.0
   endif ; enddo ; enddo
   if (associated(taux_bot) .and. associated(tauy_bot)) then
     !$OMP parallel do default(shared)
@@ -2293,6 +2304,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
 
     if (CS%id_ubtforce > 0) call post_data(CS%id_ubtforce, BT_force_u(IsdB:IedB,jsd:jed), CS%diag)
     if (CS%id_vbtforce > 0) call post_data(CS%id_vbtforce, BT_force_v(isd:ied,JsdB:JedB), CS%diag)
+    if (CS%id_ubtforcetaux > 0) call post_data(CS%id_ubtforcetaux, BT_force_taux(IsdB:IedB,jsd:jed), CS%diag)
+    if (CS%id_vbtforcetauy > 0) call post_data(CS%id_vbtforcetauy, BT_force_tauy(isd:ied,JsdB:JedB), CS%diag)
     if (CS%id_uaccel > 0) call post_data(CS%id_uaccel, u_accel_bt(IsdB:IedB,jsd:jed), CS%diag)
     if (CS%id_vaccel > 0) call post_data(CS%id_vaccel, v_accel_bt(isd:ied,JsdB:JedB), CS%diag)
 
@@ -5854,6 +5867,10 @@ subroutine barotropic_init(u, v, h, eta, Time, G, GV, US, param_file, diag, CS, 
       'Barotropic zonal acceleration from baroclinic terms', 'm s-2', conversion=US%L_T2_to_m_s2)
   CS%id_vbtforce = register_diag_field('ocean_model', 'vbtforce', diag%axesCv1, Time, &
       'Barotropic meridional acceleration from baroclinic terms', 'm s-2', conversion=US%L_T2_to_m_s2)
+  CS%id_ubtforcetaux = register_diag_field('ocean_model', 'ubt_taux', diag%axesCu1, Time, &
+      'Acceleration from surface stress, x', 'm s-2', conversion=US%L_T2_to_m_s2)
+  CS%id_vbtforcetauy = register_diag_field('ocean_model', 'vbt_tauy', diag%axesCv1, Time, &
+      'Acceleration from surface stress, y', 'm s-2', conversion=US%L_T2_to_m_s2)
   CS%id_ubtdt = register_diag_field('ocean_model', 'ubt_dt', diag%axesCu1, Time, &
       'Barotropic zonal acceleration', 'm s-2', conversion=US%L_T2_to_m_s2)
   CS%id_vbtdt = register_diag_field('ocean_model', 'vbt_dt', diag%axesCv1, Time, &

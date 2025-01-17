@@ -1172,13 +1172,118 @@ subroutine convert_merged_ice(seaice_in, seaice_out)
   seaice_out = seaice_in 
 end subroutine
 
-subroutine extract_merged_ice_from_IOB(iob, seaice)
+subroutine extract_merged_ice_from_IOB(IOB, seaice, index_bounds, Time, G, US, CS, tau_halo)
   type(ice_ocean_boundary_type), &
-                    intent(in) :: iob   !< An ice-ocean boundary type with fluxes to drive the
+                   target, intent(in)    :: IOB  !< An ice-ocean boundary type with fluxes to drive
+                                                 !! the ocean in a coupled model
   type(SIS_dyn_state_2d),  &
-                    intent(inout) :: seaice
+                           intent(inout) :: seaice
+  integer,        optional, intent(in)    :: tau_halo !< The halo size of wind stresses to set, 0 by default.
+  integer, dimension(4),   intent(in)    :: index_bounds !< The i- and j- size of the arrays in IOB.
+  type(time_type),         intent(in)    :: Time !< The time of the fluxes, used for interpolating the
+                                                 !! salinity to the right time, when it is being restored.
+  type(ocean_grid_type),   intent(inout) :: G    !< The ocean's grid structure
+  type(unit_scale_type),   intent(in)    :: US   !< A dimensional unit scaling type
+  type(surface_forcing_CS),pointer       :: CS   !< A pointer to the control structure returned by a
+                                                 !! previous call to surface_forcing_init.
+  ! Local variables
+  real, dimension(SZIB_(G),SZJ_(G)) :: u_in_C  ! Zonal velocity 
+  !real, dimension(SZIB_(G),SZJ_(G)) :: uh_step  ! 
+  real, dimension(SZIB_(G),SZJ_(G)) :: WindStr_x  ! 
+  real, dimension(SZIB_(G),SZJ_(G)) :: WindStr_ocn_x  ! 
 
-  seaice = iob%IceDS2d
+  real, dimension(SZI_(G),SZJB_(G)) :: v_in_C  ! Meridional velocity [R Z L T-2 ~> Pa] at v points
+  !real, dimension(SZI_(G),SZJB_(G)) :: vh_step 
+  real, dimension(SZI_(G),SZJB_(G)) :: WindStr_y 
+  real, dimension(SZI_(G),SZJB_(G)) :: WindStr_ocn_y
+
+  real, dimension(SZI_(G),SZJ_(G)) :: &
+                                      mi_sum, &
+                                      ice_free, &
+                                      ice_cover, &
+                                      FIA_ice_free, &
+                                      FIA_ice_cover
+
+  integer :: i, j, is, ie, js, je, ish, ieh, jsh, jeh, Isqh, Ieqh, Jsqh, Jeqh, i0, j0, halo
+
+  halo = tau_halo
+  is   = G%isc   ; ie   = G%iec    ; js   = G%jsc   ; je   = G%jec
+  ish  = G%isc-halo  ; ieh   = G%iec+halo  ; jsh  = G%jsc-halo  ; jeh  = G%jec+halo
+  Isqh = G%IscB-halo ; Ieqh  = G%IecB+halo ; Jsqh = G%JscB-halo ; Jeqh = G%JecB+halo
+  i0 = is - index_bounds(1) ; j0 = js - index_bounds(3)
+
+  !is   = G%isc   ; ie   = G%iec    ; js   = G%jsc   ; je   = G%jec
+  !Isq  = G%IscB  ; Ieq  = G%IecB   ; Jsq  = G%JscB  ; Jeq  = G%JecB
+  !isd  = G%isd   ; ied  = G%ied    ; jsd  = G%jsd   ; jed  = G%jed
+  !IsdB = G%IsdB  ; IedB = G%IedB   ; JsdB = G%JsdB  ; JedB = G%JedB
+  !isr = is-isd+1 ; ier  = ie-isd+1 ; jsr = js-jsd+1 ; jer = je-jsd+1
+
+  !i0 = is - isc_bnd ; j0 = js - jsc_bnd
+  !do j=js,je ; do i=is,ie
+  !    fluxes%lprec(i,j) = kg_m2_s_conversion * IOB%lprec(i-i0,j-j0) * G%mask2dT(i,j)
+  !enddo; enddo
+
+  ! Set surface momentum stress related fields as a function of staggering.
+  u_in_C(:,:) = 0.0 ; v_in_C(:,:) = 0.0
+  ice_cover(:,:) = 0.0 ; mi_sum(:,:) = 0.0
+  WindStr_x(:,:) = 0.0 ; WindStr_ocn_x(:,:) = 0.0
+  WindStr_y(:,:) = 0.0 ; WindStr_ocn_y(:,:) = 0.0
+  FIA_ice_cover(:,:) = 0.0 ; FIA_ice_free(:,:) = 0.0
+  do j=js,je ; do i=is,ie
+    mi_sum(i,J) = IOB%IceDS2d%mi_sum(i-i0,j-j0)
+    ice_cover(i,J) = IOB%IceDS2d%ice_cover(i-i0,j-j0)
+    FIA_ice_free(i,J) = IOB%IceDS2d%FIA_2d%ice_free(i-i0,j-j0)
+    FIA_ice_cover(i,J) = IOB%IceDS2d%FIA_2d%ice_cover(i-i0,j-j0)
+
+    u_in_C(I,j) = IOB%IceDS2d%u_ice_C(i-i0,j-j0)
+    v_in_C(i,J) = IOB%IceDS2d%v_ice_C(i-i0,j-j0)
+    !uh_step(I,j,:) = IOB%IceDS2d%uh_step(i-i0,j-j0,:)
+    !vh_step(i,J,:) = IOB%IceDS2d%vh_step(i-i0,j-j0,:)
+
+    WindStr_x(I,j) = IOB%IceDS2d%FIA_2d%WindStr_x(i-i0,j-j0)
+    WindStr_y(i,J) = IOB%IceDS2d%FIA_2d%WindStr_y(i-i0,j-j0)
+    WindStr_ocn_x(I,j) = IOB%IceDS2d%FIA_2d%WindStr_ocn_x(i-i0,j-j0)
+    WindStr_ocn_y(i,J) = IOB%IceDS2d%FIA_2d%WindStr_ocn_y(i-i0,j-j0)
+  enddo ; enddo
+
+  if (G%symmetric) call fill_symmetric_edges(u_in_C, v_in_C, G%Domain)
+  !if (G%symmetric) call fill_symmetric_edges(uh_step, vh_step, G%Domain)
+  if (G%symmetric) call fill_symmetric_edges(WindStr_x, WindStr_y, G%Domain)
+  if (G%symmetric) call fill_symmetric_edges(WindStr_ocn_x, WindStr_ocn_y, G%Domain)
+  call pass_vector(u_in_C, v_in_C, G%Domain, halo=max(1,halo))
+  !call pass_vector(uh_step, vh_step, G%Domain, halo=max(1,halo))
+  call pass_vector(WindStr_x, WindStr_y, G%Domain, halo=max(1,halo))
+  call pass_vector(WindStr_ocn_x, WindStr_ocn_y, G%Domain, halo=max(1,halo))
+  call pass_var(mi_sum, G%Domain, halo=max(1,halo))
+  !call pass_var(ice_free, G%Domain, halo=max(1,halo))
+  call pass_var(ice_cover, G%Domain, halo=max(1,halo))
+  call pass_var(FIA_ice_free, G%Domain, halo=max(1,halo))
+  call pass_var(FIA_ice_cover, G%Domain, halo=max(1,halo))
+
+  do j=jsh,jeh ; do i=ish,ieh
+    seaice%ice_cover(i,j) = G%mask2dT(i,j)*ice_cover(i,j)
+    seaice%mi_sum(i,j) = G%mask2dT(i,j)*mi_sum(i,j)
+    seaice%FIA_2d%ice_free(i,j) = G%mask2dT(i,j)*FIA_ice_free(i,j)
+    seaice%FIA_2d%ice_cover(i,j) = G%mask2dT(i,j)*FIA_ice_cover(i,j)
+  enddo ; enddo
+  do j=jsh,jeh ; do I=Isqh,Ieqh
+    seaice%u_ice_C(I,j) = G%mask2dCu(I,j)*u_in_C(I,j)
+    !seaice%uh_step(I,j,:) = G%mask2dCu(I,j)*uh_step(I,j,:)
+    seaice%FIA_2d%WindStr_x(I,j) = G%mask2dCu(I,j)*WindStr_x(I,j)
+    seaice%FIA_2d%WindStr_ocn_x(I,j) = G%mask2dCu(I,j)*WindStr_ocn_x(I,j)
+  enddo ; enddo
+  do J=Jsqh,Jeqh ; do i=ish,ieh
+    seaice%v_ice_C(i,J) = G%mask2dCv(i,J)*v_in_C(i,J)
+    !seaice%vh_step(i,J,:) = G%mask2dCv(i,J)*vh_step(i,J,:)
+    seaice%FIA_2d%WindStr_y(i,J) = G%mask2dCv(i,J)*WindStr_y(i,J)
+    seaice%FIA_2d%WindStr_ocn_y(i,J) = G%mask2dCv(i,J)*WindStr_ocn_y(i,J)
+  enddo ; enddo
+
+  seaice%SIS_C_dyn_CSp = IOB%IceDS2d%SIS_C_dyn_CSp
+  seaice%dynmer_trans_CSp = IOB%IceDS2d%dynmer_trans_CSp
+  seaice%sG = IOB%IceDS2d%sG
+  seaice%IG = IOB%IceDS2d%IG
+  seaice%US = IOB%IceDS2d%US
   
 !  seaice%max_nts = iob%IceDS2d 
 !  seaice%nts = iob% 
@@ -1198,7 +1303,7 @@ subroutine extract_merged_ice_from_IOB(iob, seaice)
 !  seaice%FIA_2d = iob%
 !  seaice%SIS_C_dyn_CSp = iob%
 !  seaice%dynmer_trans_CSp = iob%
-!  seaice%sG = iob%
+!  seaice%sG = iob%y
 !  seaice%IG = iob%
 !  seaice%US = iob%
 
@@ -1342,9 +1447,11 @@ subroutine seaice_init(G, DS2d)
 
   ! Local variables
   integer :: i, j, isd, ied, jsd, jed
+  integer :: isc, iec, jsc, jec
   integer :: isdB, iedB, jsdB, jedB
 
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isdB = G%isdB ; iedB = G%iedB ; jsdB = G%jsdB ; jedB = G%jedB
 
   if (.not.associated(DS2d)) allocate(DS2d)
@@ -1363,8 +1470,8 @@ subroutine seaice_init(G, DS2d)
   call safe_alloc(DS2d%u_ice_C, G%IsdB, G%IedB, G%jsd, G%jed)
   call safe_alloc(DS2d%v_ice_C, G%isd, G%ied, G%JsdB, G%JedB)
 
-  !call safe_alloc(DS2d%uh_step, G%IsdB, G%IedB, G%jsd, G%jed)
-  !call safe_alloc(DS2d%vh_step, G%isd, G%ied, G%JsdB, G%JedB)
+  call safe_alloc(DS2d%uh_step, G%IsdB, G%IedB, G%jsd, G%jed, 3)
+  call safe_alloc(DS2d%vh_step, G%isd, G%ied, G%JsdB, G%JedB, 3)
   !call safe_alloc(DS2d%mca_step, G%isd, G%ied, G%jsd, G%jed)
   ! only needed for embedded/semiembedded coupling
   if (.not.associated(DS2d%FIA_2d)) allocate(DS2d%FIA_2d)
@@ -1384,7 +1491,7 @@ subroutine seaice_init(G, DS2d)
   if (.not.associated(DS2d%dynmer_trans_CSp%cover_trans_CSp)) allocate(DS2d%dynmer_trans_CSp%cover_trans_CSp)
   !DS2d%dynmer_trans_CSp%cover_trans_CSp = CS%cover_trans_CSp
   !CS%DS2d%SIS_C_dyn_CSp => CS%SIS_C_dyn_CSp
-  !! if (.not.associated(DS2d%SIS_C_dyn_CSp)) allocate(DS2d%SIS_C_dyn_CSp)
+  if (.not.associated(DS2d%SIS_C_dyn_CSp)) allocate(DS2d%SIS_C_dyn_CSp)
   !! DS2d%SIS_C_dyn_CSp = CS%SIS_C_dyn_CSp
   if (.not.associated(DS2d%sG)) allocate(DS2d%sG)
   !DS2d%sG = G

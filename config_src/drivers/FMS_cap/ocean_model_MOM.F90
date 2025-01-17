@@ -553,7 +553,8 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
       call iceberg_forces(OS%grid, OS%forces, OS%use_ice_shelf, &
                           OS%sfc_state, dt_coupling, OS%marine_ice_CSp)
     if (OS%use_dynmer_ice) &
-      call extract_merged_ice_from_IOB(Ice_ocean_boundary, OS%seaice) ! where will this be put?
+      call extract_merged_ice_from_IOB(Ice_ocean_boundary, OS%seaice, index_bnds, OS%Time_dyn, &
+                                       OS%grid, OS%US, OS%forcing_CSp, tau_halo=1)
   endif
 
   if (do_thermo) then
