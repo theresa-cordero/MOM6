@@ -5890,6 +5890,3 @@ end subroutine register_barotropic_restarts
 !!  the restart files, and to ensure that they are read.
 
 end module MOM_barotropic
-
-
-
