@@ -1927,24 +1927,24 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     if (find_PF) then
       !$OMP do
       do j=js,je ; do I=is-1,ie
-        PFu_bt_sum(I,j)  = PFu_bt_sum(I,j) + wt_accel2_n * PFu(I,j)
+        PFu_bt_sum(I,j)  = PFu_bt_sum(I,j) + wt_accel2(n) * PFu(I,j)
       enddo ; enddo
       !$OMP end do nowait
       !$OMP do
       do J=js-1,je ; do i=is,ie
-        PFv_bt_sum(i,J)  = PFv_bt_sum(i,J) + wt_accel2_n * PFv(i,J)
+        PFv_bt_sum(i,J)  = PFv_bt_sum(i,J) + wt_accel2(n) * PFv(i,J)
       enddo ; enddo
       !$OMP end do nowait
     endif
     if (find_Cor) then
       !$OMP do
       do j=js,je ; do I=is-1,ie
-        Coru_bt_sum(I,j) = Coru_bt_sum(I,j) + wt_accel2_n * Cor_u(I,j)
+        Coru_bt_sum(I,j) = Coru_bt_sum(I,j) + wt_accel2(n) * Cor_u(I,j)
       enddo ; enddo
       !$OMP end do nowait
       !$OMP do
       do J=js-1,je ; do i=is,ie
-        Corv_bt_sum(i,J) = Corv_bt_sum(i,J) + wt_accel2_n * Cor_v(i,J)
+        Corv_bt_sum(i,J) = Corv_bt_sum(i,J) + wt_accel2(n) * Cor_v(i,J)
       enddo ; enddo
       !$OMP end do nowait
     endif
