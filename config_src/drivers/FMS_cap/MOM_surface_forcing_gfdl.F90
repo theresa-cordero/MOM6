@@ -1459,7 +1459,7 @@ subroutine seaice_init(G, DS2d)
   !if (CS%do_ridging) call safe_alloc(DS2d%avg_ridge_rate, G%isd, G%ied, G%jsd, G%jed)
 
   !if (CS%merged_cont) then
-  DS2d%nts = 0 ; DS2d%max_nts = 0
+  DS2d%nts = 1 ; DS2d%max_nts = 0
   call safe_alloc(DS2d%mi_sum, G%isd, G%ied, G%jsd, G%jed)
   call safe_alloc(DS2d%ice_cover, G%isd, G%ied, G%jsd, G%jed)
   !max_nts = CS%adv_substeps

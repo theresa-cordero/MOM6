@@ -1637,6 +1637,9 @@ subroutine seaice_step(DS2d, G, sG, uo, vo, eta, dt_slow, time_local, taux, tauy
   if (corr_step) then
     DS2d%ice_cover = ice_cover ; DS2d%mi_sum = mis; DS2d%mi_sum = mice ;
     DS2d%u_ice_C = ui ; DS2d%v_ice_C = vi;
+    DS2d%uh_step(:,:,1) = uh_step(:,:)
+    DS2d%vh_step(:,:,1) = vh_step(:,:)
+    DS2d%nts = DS2d%nts + 1  
   endif
  
 end subroutine seaice_step
