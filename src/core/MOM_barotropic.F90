@@ -1353,6 +1353,8 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
     BT_force_u(I,j) = 0.0
     BT_force_taux(I,j) = 0.0
   endif ; enddo ; enddo
+  call uvchksum("tau[xy]_surf as BT_force_[uv]", BT_force_u, BT_force_v, &
+                CS%debug_BT_HI, haloshift=0, unscale=US%L_T2_to_m_s2)
   !$OMP parallel do default(shared)
   do J=js-1,je ; do i=is,ie ; if (G%mask2dCv(i,J) > 0.0) then
     if (CS%nonlin_stress) then
