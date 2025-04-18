@@ -23,7 +23,7 @@ use MOM_domains,           only : To_South, To_West, To_All, CGRID_NE, SCALAR_PA
 use MOM_domains,           only : To_North, To_East, Omit_Corners
 use MOM_domains,           only : create_group_pass, do_group_pass, group_pass_type
 use MOM_domains,           only : start_group_pass, complete_group_pass, pass_var, pass_vector
-use MOM_debugging,         only : hchksum, uvchksum, query_debugging_checks
+use MOM_debugging,         only : hchksum, uvchksum, hchksum_pair, query_debugging_checks
 use MOM_error_handler,     only : MOM_error, MOM_mesg, FATAL, WARNING, is_root_pe
 use MOM_error_handler,     only : MOM_set_verbosity, callTree_showQuery
 use MOM_error_handler,     only : callTree_enter, callTree_leave, callTree_waypoint
@@ -1315,14 +1315,16 @@ subroutine seaice_stress(DS2d, G, sG, uo, vo, taux, tauy)
   halo = 0 ! ; if (present(tau_halo)) halo = tau_halo
 
   !call pass_vector(taux_in_C, tauy_in_C, sG%Domain, halo=max(1,halo))
-  call pass_vector(DS2d%FIA_2d%WindStr_x, DS2d%FIA_2d%WindStr_y, sG%Domain, stagger=AGRID, complete=.false.)
-  call pass_vector(DS2d%FIA_2d%WindStr_ocn_x, DS2d%FIA_2d%WindStr_ocn_y, sG%Domain, stagger=AGRID)
-  call pass_var(DS2d%ice_cover, sG%Domain, complete=.false.)
+  ! line 1319  was giving a halo error, trying again without pass vector
+  !call pass_vector(DS2d%FIA_2d%WindStr_x, DS2d%FIA_2d%WindStr_y, sG%Domain, stagger=AGRID, complete=.false.)
+  !call pass_vector(DS2d%FIA_2d%WindStr_ocn_x, DS2d%FIA_2d%WindStr_ocn_y, sG%Domain, stagger=AGRID)
+  !call pass_var(DS2d%ice_cover, sG%Domain, complete=.false.)
 
   call uvchksum("Before seaice_stress [uv]_ice_C", ui, vi, G%HI, haloshift=0, unscale=US%L_T_to_m_s)
   call uvchksum("Before seaice_stress [uv]_ocn_C", uo, vo, G%HI, haloshift=0, unscale=US%L_T_to_m_s)
   call hchksum(ice_cover, "ice_cover before SIS_C_dynamics", G%HI, haloshift=0)
-  call uvchksum("Before seaice_stress FIA_2d WindStr_ocn_[xy]", DS2d%FIA_2d%WindStr_ocn_x, DS2d%FIA_2d%WindStr_ocn_y, G%HI, haloshift=0)
+  !call uvchksum("Before seaice_stress FIA_2d WindStr_ocn_[xy]", DS2d%FIA_2d%WindStr_ocn_x, DS2d%FIA_2d%WindStr_ocn_y, G%HI, haloshift=0)
+  call hchksum_pair("Before seaice_stress FIA_2d WindStr_ocn_[xy]", DS2d%FIA_2d%WindStr_ocn_x, DS2d%FIA_2d%WindStr_ocn_y, G%HI) !,  haloshift=0)
 
     !call hchksum(DS2d%mca_step(:,:,DS2d%nts), "misp_sum before SIS_C_dynamics", G%HI, scale=US%RZ_to_kg_m2)
   ! fxat and fyat should be added here, but really just want wind  
