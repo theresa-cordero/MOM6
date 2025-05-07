@@ -95,6 +95,7 @@ type, public :: ALE_sponge_CS ; private
   integer :: nz        !< The total number of layers.
   integer :: nz_data   !< The total number of arbitrary layers (used by older code).
   integer :: num_col   !< The number of sponge tracer points within the computational domain.
+  integer :: num_col_GT!< The number of sponge tracer points within the computational domain.
   integer :: num_col_u !< The number of sponge u-points within the computational domain.
   integer :: num_col_v !< The number of sponge v-points within the computational domain.
   integer :: fldno = 0 !< The number of fields which have already been
@@ -102,6 +103,8 @@ type, public :: ALE_sponge_CS ; private
   logical :: sponge_uv !< Control whether u and v are included in sponge
   integer, allocatable :: col_i(:)    !< Array of the i-indices of each tracer column being damped
   integer, allocatable :: col_j(:)    !< Array of the j-indices of each tracer column being damped
+  integer, allocatable :: col_i_GT(:) !< Array of the i-indices of each tracer column being damped
+  integer, allocatable :: col_j_GT(:) !< Array of the j-indices of each tracer column being damped
   integer, allocatable :: col_i_u(:)  !< Array of the i-indices of each u-column being damped
   integer, allocatable :: col_j_u(:)  !< Array of the j-indices of each u-column being damped
   integer, allocatable :: col_i_v(:)  !< Array of the i-indices of each v-column being damped
@@ -157,7 +160,7 @@ contains
 !! domain.  Only points that have positive values of Iresttime and which mask2dT indicates are ocean
 !! points are included in the sponges.  It also stores the target interface heights.
 subroutine initialize_ALE_sponge_fixed(Iresttime, G, GV, param_file, CS, data_h, nz_data, &
-                                       Iresttime_u_in, Iresttime_v_in, data_h_is_Z)
+                                       Iresttime_u_in, Iresttime_v_in, Iresttime_GT_in, data_h_is_Z)
 
   type(ocean_grid_type),            intent(in) :: G !< The ocean's grid structure.
   type(verticalGrid_type),          intent(in) :: GV !< ocean vertical grid structure
@@ -174,6 +177,7 @@ subroutine initialize_ALE_sponge_fixed(Iresttime, G, GV, param_file, CS, data_h,
                                                                              !! time at U-points [T-1 ~> s-1].
   real, dimension(SZI_(G),SZJB_(G)), optional, intent(in) :: Iresttime_v_in  !< The inverse of the restoring
                                                                              !! time at v-points [T-1 ~> s-1].
+  real, dimension(SZI_(G),SZJ_(G)),  optional, intent(in) :: Iresttime_GT_in !< The inverse of the restoring time for generic tracers [T-1 ~> s-1].
   logical,                optional, intent(in) :: data_h_is_Z  !< If present and true data_h is already in
                                                      !! depth units.  Omitting this is the same as setting
                                                      !! it to false.
@@ -468,7 +472,7 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
                                                                             !! for u [T-1 ~> s-1].
   real, dimension(SZI_(G),SZJB_(G)), intent(in), optional :: Iresttime_v_in !< The inverse of the restoring time
                                                                             !! for v [T-1 ~> s-1].
-  real, dimension(SZI_(G),SZJ_(G)), intent(in) :: Iresttime_GT_in !< The inverse of the restoring time for generic tracers [T-1 ~> s-1].
+  real, dimension(SZI_(G),SZJ_(G)), intent(in), optional:: Iresttime_GT_in !< The inverse of the restoring time for generic tracers [T-1 ~> s-1].
 
   ! Local variables
   character(len=40)  :: mdl = "MOM_sponge"  ! This module's name.
@@ -487,7 +491,10 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
   logical :: generic_tracer_sponge
 
   generic_tracer_sponge = .false.
-  if (present(Iresttime_GT_in)) generic_tracer_sponge = .true.
+  if (present(Iresttime_GT_in)) then
+    generic_tracer_sponge = .true.
+    call MOM_error(WARNING, "initialize_ALE_sponge_varying for generic sponges") 
+  endif
 
   !### need to add something here to make sure this is not triggered when called by GT
   if (associated(CS) .and. .not.generic_tracer_sponge) then
@@ -557,6 +564,13 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
     if ((Iresttime(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) &
       CS%num_col = CS%num_col + 1
   enddo ; enddo
+  if (generic_tracer_sponge) then
+    CS%num_col_GT = 0 
+    do j=G%jsc,G%jec ; do i=G%isc,G%iec
+      if ((Iresttime_GT_in(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) &
+        CS%num_col_GT = CS%num_col_GT + 1
+    enddo ; enddo
+  endif
   if (CS%num_col > 0) then
     allocate(CS%Iresttime_col(CS%num_col), source=0.0)
     allocate(CS%col_i(CS%num_col), source=0)
@@ -564,8 +578,11 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
     ! pass indices, restoring time to the CS structure
     col = 1
     if (generic_tracer_sponge) then
+      allocate(CS%col_i_GT(CS%num_col_GT), source=0)
+      allocate(CS%col_j_GT(CS%num_col_GT), source=0)
+      allocate(CS%Iresttime_col_GT(CS%num_col_GT), source=0.0)
       do j=G%jsc,G%jec ; do i=G%isc,G%iec
-        if ((Iresttime(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) then
+        if ((Iresttime_GT_in(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) then
           CS%col_i(col) = i ; CS%col_j(col) = j
           CS%Iresttime_col_GT(col) = Iresttime_GT_in(i,j)
           col = col + 1
@@ -713,7 +730,7 @@ end subroutine init_ALE_sponge_diags
 !> This subroutine stores the reference profile at h points for the variable
 !! whose address is given by f_ptr.
 subroutine set_up_ALE_sponge_field_fixed(sp_val, G, GV, f_ptr, CS,  &
-                                           sp_name, sp_long_name, sp_unit, scale)
+                                           sp_name, sp_long_name, sp_unit, scale, which_iresttime)
   type(ocean_grid_type),   intent(in) :: G  !< Grid structure
   type(verticalGrid_type), intent(in) :: GV !< ocean vertical grid structure
   type(ALE_sponge_CS),     pointer    :: CS !< ALE sponge control structure (in/out).
@@ -732,6 +749,7 @@ subroutine set_up_ALE_sponge_field_fixed(sp_val, G, GV, f_ptr, CS,  &
   real,          optional, intent(in) :: scale !< A factor by which to rescale the input data, including any
                                                !! contributions due to dimensional rescaling [various ~> 1].
                                                !! The default is 1.
+  integer,       optional, intent(in) :: which_iresttime !< integer to indicate which iresttime to use, one for T, S, U, V, or one for generic tracers [unitless]  
 
   real :: scale_fac  ! A factor by which to scale sp_val before storing it [various ~> 1]
   integer :: k, col
@@ -767,6 +785,12 @@ subroutine set_up_ALE_sponge_field_fixed(sp_val, G, GV, f_ptr, CS,  &
   enddo
 
   CS%var(CS%fldno)%p => f_ptr
+
+  if (present(which_iresttime)) then
+    CS%which_iresttime_col(CS%fldno) = which_iresttime
+  else
+    CS%which_iresttime_col(CS%fldno) = 0 
+  endif 
 
 end subroutine set_up_ALE_sponge_field_fixed
 
@@ -841,9 +865,12 @@ subroutine set_up_ALE_sponge_field_varying(filename, fieldname, Time, G, GV, US,
   CS%var(CS%fldno)%p => f_ptr
 
   if (present(which_iresttime)) then
-    CS%which_iresttime(CS%fldno) = which_iresttime
+  !  write(mesg, '("which_iresttime is set to ",I3," using different sponge for generic "//&
+  !      &" tracer variables." )') which_iresttime 
+  !  call MOM_error(warning,"set_up_ALE_sponge_field: "//mesg)
+    CS%which_iresttime_col(CS%fldno) = which_iresttime
   else
-    CS%which_iresttime(CS%fldno) = 0 
+    CS%which_iresttime_col(CS%fldno) = 0 
   endif 
 
 end subroutine set_up_ALE_sponge_field_varying
@@ -1005,6 +1032,7 @@ subroutine apply_ALE_sponge(h, tv, dt, G, GV, US, CS, Time)
   real :: sp_val_u ! Interpolation of sp_val to u-points, often a velocity in [L T-1 ~> m s-1]
   real :: sp_val_v ! Interpolation of sp_val to v-points, often a velocity in [L T-1 ~> m s-1]
   integer :: nPoints
+  character(len=256) :: mesg ! String for error messages
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
   if (.not.associated(CS)) return
@@ -1062,7 +1090,7 @@ subroutine apply_ALE_sponge(h, tv, dt, G, GV, US, CS, Time)
     if (CS%id_sp_tendency(m) > 0) then
       allocate(tmp(G%isd:G%ied,G%jsd:G%jed,nz), source=0.0)
     endif
-    if (CS%which_iresttime(CS%fldno)==0) then
+    if (CS%which_iresttime_col(CS%fldno)==0) then
       do c=1,CS%num_col
         ! Set i and j to the structured indices of column c.
         i = CS%col_i(c) ; j = CS%col_j(c)
@@ -1091,11 +1119,13 @@ subroutine apply_ALE_sponge(h, tv, dt, G, GV, US, CS, Time)
         if (CS%id_sp_tendency(m) > 0) &
              tmp(i,j,1:CS%nz) = Idt*(CS%var(m)%p(i,j,1:nz) - tmp(i,j,1:nz))
       enddo
-    elseif (CS%which_iresttime(CS%fldno)==1) then
-      do c=1,CS%num_col
+    elseif (CS%which_iresttime_col(CS%fldno)==1) then
+      write(mesg, '("Appling generic tracer sponge to feild number ",I3, "." )') CS%fldno
+      call MOM_error(Warning, "Applying generic tracer sponge."//mesg)
+      do c=1,CS%num_col_GT
         ! Set i and j to the structured indices of column c.
-        i = CS%col_i(c) ; j = CS%col_j(c)
-        damp = dt * CS%Iresttime_col(c)
+        i = CS%col_i_GT(c) ; j = CS%col_j_GT(c)
+        damp = dt * CS%Iresttime_col_GT(c)
         I1pdamp = 1.0 / (1.0 + damp)
         tmp_val2(1:nz_data) = CS%Ref_val(m)%p(1:nz_data,c)
         if ((.not.GV%Boussinesq) .and. allocated(tv%SpV_avg))  then
