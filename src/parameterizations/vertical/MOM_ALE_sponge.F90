@@ -108,8 +108,10 @@ type, public :: ALE_sponge_CS ; private
   integer, allocatable :: col_j_v(:)  !< Array of the j-indices of each v-column being damped
 
   real, allocatable :: Iresttime_col(:)   !< The inverse restoring time of each tracer column [T-1 ~> s-1]
+  real, allocatable :: Iresttime_col_GT(:)!< The inverse restoring time of each tracer column for the generic tracers [T-1 ~> s-1]
   real, allocatable :: Iresttime_col_u(:) !< The inverse restoring time of each u-column [T-1 ~> s-1]
   real, allocatable :: Iresttime_col_v(:) !< The inverse restoring time of each v-column [T-1 ~> s-1]
+  integer, dimension(MAX_FIELDS_) :: which_iresttime_col !< list of integers that indicate which Iresttime_col to use for a given tracer
 
   type(p3d) :: var(MAX_FIELDS_)      !< Pointers to the fields that are being damped.
   type(p2d) :: Ref_val(MAX_FIELDS_) !< The values to which the fields are damped.
@@ -452,7 +454,7 @@ end subroutine get_ALE_sponge_thicknesses
 !> This subroutine determines the number of points which are to be restored in the computational
 !! domain.  Only points that have positive values of Iresttime and which mask2dT indicates are ocean
 !! points are included in the sponges.
-subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, Iresttime_u_in, Iresttime_v_in)
+subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, Iresttime_u_in, Iresttime_v_in, Iresttime_GT_in)
 
   type(ocean_grid_type),            intent(in) :: G !< The ocean's grid structure.
   type(verticalGrid_type),          intent(in) :: GV !< ocean vertical grid structure
@@ -466,11 +468,13 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
                                                                             !! for u [T-1 ~> s-1].
   real, dimension(SZI_(G),SZJB_(G)), intent(in), optional :: Iresttime_v_in !< The inverse of the restoring time
                                                                             !! for v [T-1 ~> s-1].
+  real, dimension(SZI_(G),SZJ_(G)), intent(in) :: Iresttime_GT_in !< The inverse of the restoring time for generic tracers [T-1 ~> s-1].
 
   ! Local variables
   character(len=40)  :: mdl = "MOM_sponge"  ! This module's name.
   real, allocatable, dimension(:,:) :: Iresttime_u !< inverse of the restoring time at u points [T-1 ~> s-1]
   real, allocatable, dimension(:,:) :: Iresttime_v !< inverse of the restoring time at v points [T-1 ~> s-1]
+  real, allocatable, dimension(:,:) :: Iresttime_GT !< inverse of the restoring time for generic tracers [T-1 ~> s-1]
   real :: dz_neglect, dz_neglect_edge ! Negligible layer extents [Z ~> m]
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
@@ -480,8 +484,13 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
   integer :: default_answer_date  ! The default setting for the various ANSWER_DATE flags.
   logical :: om4_remap_via_sub_cells ! If true, use the OM4 remapping algorithm
   integer :: i, j, col, total_sponge_cols, total_sponge_cols_u, total_sponge_cols_v
+  logical :: generic_tracer_sponge
 
-  if (associated(CS)) then
+  generic_tracer_sponge = .false.
+  if (present(Iresttime_GT_in)) generic_tracer_sponge = .true.
+
+  !### need to add something here to make sure this is not triggered when called by GT
+  if (associated(CS) .and. .not.generic_tracer_sponge) then
     call MOM_error(WARNING, "initialize_ALE_sponge_varying called with an associated "// &
                             "control structure.")
     return
@@ -554,13 +563,23 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
     allocate(CS%col_j(CS%num_col), source=0)
     ! pass indices, restoring time to the CS structure
     col = 1
-    do j=G%jsc,G%jec ; do i=G%isc,G%iec
-      if ((Iresttime(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) then
-        CS%col_i(col) = i ; CS%col_j(col) = j
-        CS%Iresttime_col(col) = Iresttime(i,j)
-        col = col + 1
-      endif
-    enddo ; enddo
+    if (generic_tracer_sponge) then
+      do j=G%jsc,G%jec ; do i=G%isc,G%iec
+        if ((Iresttime(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) then
+          CS%col_i(col) = i ; CS%col_j(col) = j
+          CS%Iresttime_col_GT(col) = Iresttime_GT_in(i,j)
+          col = col + 1
+        endif
+      enddo ; enddo
+    else 
+      do j=G%jsc,G%jec ; do i=G%isc,G%iec
+        if ((Iresttime(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) then
+          CS%col_i(col) = i ; CS%col_j(col) = j
+          CS%Iresttime_col(col) = Iresttime(i,j)
+          col = col + 1
+        endif
+      enddo ; enddo
+    endif
   endif
   total_sponge_cols = CS%num_col
   call sum_across_PEs(total_sponge_cols)
@@ -754,7 +773,7 @@ end subroutine set_up_ALE_sponge_field_fixed
 !> This subroutine stores the reference profile at h points for the variable
 !! whose address is given by filename and fieldname.
 subroutine set_up_ALE_sponge_field_varying(filename, fieldname, Time, G, GV, US, f_ptr, CS,  &
-                                             sp_name, sp_long_name, sp_unit, scale)
+                                             sp_name, sp_long_name, sp_unit, scale, which_iresttime)
   character(len=*),        intent(in) :: filename !< The name of the file with the
                                                   !! time varying field data
   character(len=*),        intent(in) :: fieldname !< The name of the field in the file
@@ -775,6 +794,7 @@ subroutine set_up_ALE_sponge_field_varying(filename, fieldname, Time, G, GV, US,
                                                  !! if not given, use 'none'
   real,          optional, intent(in) :: scale !< A factor by which to rescale the input data, including any
                                                !! contributions due to dimensional rescaling [various ~> 1].
+  integer,       optional, intent(in) :: which_iresttime !< integer to indicate which iresttime to use, one for T, S, U, V, or one for generic tracers [unitless]  
 
   ! Local variables
   integer :: isd, ied, jsd, jed
@@ -819,6 +839,12 @@ subroutine set_up_ALE_sponge_field_varying(filename, fieldname, Time, G, GV, US,
   allocate(CS%Ref_val(CS%fldno)%p(nz_data,CS%num_col), source=0.0)
   allocate(CS%Ref_val(CS%fldno)%dz(nz_data,CS%num_col), source=0.0)
   CS%var(CS%fldno)%p => f_ptr
+
+  if (present(which_iresttime)) then
+    CS%which_iresttime(CS%fldno) = which_iresttime
+  else
+    CS%which_iresttime(CS%fldno) = 0 
+  endif 
 
 end subroutine set_up_ALE_sponge_field_varying
 
@@ -1036,34 +1062,65 @@ subroutine apply_ALE_sponge(h, tv, dt, G, GV, US, CS, Time)
     if (CS%id_sp_tendency(m) > 0) then
       allocate(tmp(G%isd:G%ied,G%jsd:G%jed,nz), source=0.0)
     endif
-    do c=1,CS%num_col
-      ! Set i and j to the structured indices of column c.
-      i = CS%col_i(c) ; j = CS%col_j(c)
-      damp = dt * CS%Iresttime_col(c)
-      I1pdamp = 1.0 / (1.0 + damp)
-      tmp_val2(1:nz_data) = CS%Ref_val(m)%p(1:nz_data,c)
-      if ((.not.GV%Boussinesq) .and. allocated(tv%SpV_avg))  then
-        do k=1,nz
-          dz_col(k) = GV%H_to_RZ * h(i,j,k) * tv%SpV_avg(i,j,k)
-        enddo
-      else
-        do k=1,nz
-          dz_col(k) = GV%H_to_Z * h(i,j,k)
-        enddo
-      endif
-      if (CS%time_varying_sponges) then
-        call remapping_core_h(CS%remap_cs, nz_data, CS%Ref_val(m)%dz(1:nz_data,c), tmp_val2, &
-             CS%nz, dz_col, tmp_val1)
-      else
-        call remapping_core_h(CS%remap_cs, nz_data, CS%Ref_dz%p(1:nz_data,c), tmp_val2, &
-             CS%nz, dz_col, tmp_val1)
-      endif
-      !Backward Euler method
-      if (CS%id_sp_tendency(m) > 0) tmp(i,j,1:nz) = CS%var(m)%p(i,j,1:nz)
-      CS%var(m)%p(i,j,1:nz) = I1pdamp * (CS%var(m)%p(i,j,1:nz) + tmp_val1(1:nz) * damp)
-      if (CS%id_sp_tendency(m) > 0) &
-           tmp(i,j,1:CS%nz) = Idt*(CS%var(m)%p(i,j,1:nz) - tmp(i,j,1:nz))
-    enddo
+    if (CS%which_iresttime(CS%fldno)==0) then
+      do c=1,CS%num_col
+        ! Set i and j to the structured indices of column c.
+        i = CS%col_i(c) ; j = CS%col_j(c)
+        damp = dt * CS%Iresttime_col(c)
+        I1pdamp = 1.0 / (1.0 + damp)
+        tmp_val2(1:nz_data) = CS%Ref_val(m)%p(1:nz_data,c)
+        if ((.not.GV%Boussinesq) .and. allocated(tv%SpV_avg))  then
+          do k=1,nz
+            dz_col(k) = GV%H_to_RZ * h(i,j,k) * tv%SpV_avg(i,j,k)
+          enddo
+        else
+          do k=1,nz
+            dz_col(k) = GV%H_to_Z * h(i,j,k)
+          enddo
+        endif
+        if (CS%time_varying_sponges) then
+          call remapping_core_h(CS%remap_cs, nz_data, CS%Ref_val(m)%dz(1:nz_data,c), tmp_val2, &
+               CS%nz, dz_col, tmp_val1)
+        else
+          call remapping_core_h(CS%remap_cs, nz_data, CS%Ref_dz%p(1:nz_data,c), tmp_val2, &
+               CS%nz, dz_col, tmp_val1)
+        endif
+        !Backward Euler method
+        if (CS%id_sp_tendency(m) > 0) tmp(i,j,1:nz) = CS%var(m)%p(i,j,1:nz)
+        CS%var(m)%p(i,j,1:nz) = I1pdamp * (CS%var(m)%p(i,j,1:nz) + tmp_val1(1:nz) * damp)
+        if (CS%id_sp_tendency(m) > 0) &
+             tmp(i,j,1:CS%nz) = Idt*(CS%var(m)%p(i,j,1:nz) - tmp(i,j,1:nz))
+      enddo
+    elseif (CS%which_iresttime(CS%fldno)==1) then
+      do c=1,CS%num_col
+        ! Set i and j to the structured indices of column c.
+        i = CS%col_i(c) ; j = CS%col_j(c)
+        damp = dt * CS%Iresttime_col(c)
+        I1pdamp = 1.0 / (1.0 + damp)
+        tmp_val2(1:nz_data) = CS%Ref_val(m)%p(1:nz_data,c)
+        if ((.not.GV%Boussinesq) .and. allocated(tv%SpV_avg))  then
+          do k=1,nz
+            dz_col(k) = GV%H_to_RZ * h(i,j,k) * tv%SpV_avg(i,j,k)
+          enddo
+        else
+          do k=1,nz
+            dz_col(k) = GV%H_to_Z * h(i,j,k)
+          enddo
+        endif
+        if (CS%time_varying_sponges) then
+          call remapping_core_h(CS%remap_cs, nz_data, CS%Ref_val(m)%dz(1:nz_data,c), tmp_val2, &
+               CS%nz, dz_col, tmp_val1)
+        else
+          call remapping_core_h(CS%remap_cs, nz_data, CS%Ref_dz%p(1:nz_data,c), tmp_val2, &
+               CS%nz, dz_col, tmp_val1)
+        endif
+        !Backward Euler method
+        if (CS%id_sp_tendency(m) > 0) tmp(i,j,1:nz) = CS%var(m)%p(i,j,1:nz)
+        CS%var(m)%p(i,j,1:nz) = I1pdamp * (CS%var(m)%p(i,j,1:nz) + tmp_val1(1:nz) * damp)
+        if (CS%id_sp_tendency(m) > 0) &
+             tmp(i,j,1:CS%nz) = Idt*(CS%var(m)%p(i,j,1:nz) - tmp(i,j,1:nz))
+      enddo
+    endif
 
     if (CS%id_sp_tendency(m) > 0)  then
       call post_data(CS%id_sp_tendency(m), tmp, CS%diag)
