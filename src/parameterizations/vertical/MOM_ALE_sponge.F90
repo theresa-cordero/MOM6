@@ -198,8 +198,15 @@ subroutine initialize_ALE_sponge_fixed(Iresttime, G, GV, param_file, CS, data_h,
   integer :: default_answer_date  ! The default setting for the various ANSWER_DATE flags.
   logical :: om4_remap_via_sub_cells ! If true, use the OM4 remapping algorithm
   integer :: i, j, k, col, total_sponge_cols, total_sponge_cols_u, total_sponge_cols_v
+  logical :: generic_tracer_sponge
 
-  if (associated(CS)) then
+  generic_tracer_sponge = .false.
+  if (present(Iresttime_GT_in)) then
+    generic_tracer_sponge = .true.
+    call MOM_error(WARNING, "initialize_ALE_sponge_varying for generic sponges") 
+  endif
+
+  if (associated(CS) .and. .not.generic_tracer_sponge) then
     call MOM_error(WARNING, "initialize_ALE_sponge_fixed called with an associated "// &
                             "control structure.")
     return
@@ -262,15 +269,26 @@ subroutine initialize_ALE_sponge_fixed(Iresttime, G, GV, param_file, CS, data_h,
 
   data_h_to_Z_scale = GV%H_to_Z ; if (present(data_h_is_Z)) data_h_to_Z_scale = 1.0
 
+  if (.not.generic_tracer_sponge) then
+    CS%fldno = 0
+  endif
+
   do k=1,nz_data ; do j=G%jsc,G%jec ; do i=G%isc,G%iec
     data_dz(i,j,k) = data_h_to_Z_scale * data_h(i,j,k)
   enddo ; enddo ; enddo
   ! number of columns to be restored
-  CS%num_col = 0 ; CS%fldno = 0
+  CS%num_col = 0 ; 
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     if ((Iresttime(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) &
       CS%num_col = CS%num_col + 1
   enddo ; enddo
+  if (generic_tracer_sponge) then
+    CS%num_col_GT = 0 
+    do j=G%jsc,G%jec ; do i=G%isc,G%iec
+      if ((Iresttime_GT_in(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) &
+        CS%num_col_GT = CS%num_col_GT + 1
+    enddo ; enddo
+  endif
 
   if (CS%num_col > 0) then
     allocate(CS%Iresttime_col(CS%num_col), source=0.0)
@@ -278,13 +296,26 @@ subroutine initialize_ALE_sponge_fixed(Iresttime, G, GV, param_file, CS, data_h,
     allocate(CS%col_j(CS%num_col), source=0)
     ! pass indices, restoring time to the CS structure
     col = 1
-    do j=G%jsc,G%jec ; do i=G%isc,G%iec
-      if ((Iresttime(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) then
-        CS%col_i(col) = i ; CS%col_j(col) = j
-        CS%Iresttime_col(col) = Iresttime(i,j)
-        col = col + 1
-      endif
-    enddo ; enddo
+    if (generic_tracer_sponge) then
+      allocate(CS%col_i_GT(CS%num_col_GT), source=0)
+      allocate(CS%col_j_GT(CS%num_col_GT), source=0)
+      allocate(CS%Iresttime_col_GT(CS%num_col_GT), source=0.0)
+      do j=G%jsc,G%jec ; do i=G%isc,G%iec
+        if ((Iresttime_GT_in(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) then
+          CS%col_i_GT(col) = i ; CS%col_j_GT(col) = j
+          CS%Iresttime_col_GT(col) = Iresttime_GT_in(i,j)
+          col = col + 1
+        endif
+      enddo ; enddo
+    else 
+      do j=G%jsc,G%jec ; do i=G%isc,G%iec
+        if ((Iresttime(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) then
+          CS%col_i(col) = i ; CS%col_j(col) = j
+          CS%Iresttime_col(col) = Iresttime(i,j)
+          col = col + 1
+        endif
+      enddo ; enddo
+    endif
     ! same for total number of arbitrary layers and correspondent data
     CS%nz_data = nz_data
     allocate(CS%Ref_dz%p(CS%nz_data,CS%num_col), source=0.0)
@@ -509,7 +540,7 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
                  "The exact location and properties of those sponges are "//&
                  "specified from MOM_initialization.F90.", default=.false.)
   if (.not.use_sponge) return
-  allocate(CS)
+  if (.not.generic_tracer_sponge) allocate(CS)
   call get_param(param_file, mdl, "SPONGE_UV", CS%sponge_uv, &
                  "Apply sponges in u and v, in addition to tracers.", &
                  default=.false.)
@@ -558,8 +589,12 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
   CS%time_varying_sponges = .true.
   CS%nz = GV%ke
 
+  if (.not.generic_tracer_sponge) then
+    CS%fldno = 0
+  endif
+
   ! number of columns to be restored
-  CS%num_col = 0 ; CS%fldno = 0
+  CS%num_col = 0
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     if ((Iresttime(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) &
       CS%num_col = CS%num_col + 1
@@ -572,9 +607,9 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
     enddo ; enddo
   endif
   if (CS%num_col > 0) then
-    allocate(CS%Iresttime_col(CS%num_col), source=0.0)
-    allocate(CS%col_i(CS%num_col), source=0)
-    allocate(CS%col_j(CS%num_col), source=0)
+    !allocate(CS%Iresttime_col(CS%num_col), source=0.0)
+    !allocate(CS%col_i(CS%num_col), source=0)
+    !allocate(CS%col_j(CS%num_col), source=0)
     ! pass indices, restoring time to the CS structure
     col = 1
     if (generic_tracer_sponge) then
@@ -583,12 +618,16 @@ subroutine initialize_ALE_sponge_varying(Iresttime, G, GV, US, param_file, CS, I
       allocate(CS%Iresttime_col_GT(CS%num_col_GT), source=0.0)
       do j=G%jsc,G%jec ; do i=G%isc,G%iec
         if ((Iresttime_GT_in(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) then
-          CS%col_i(col) = i ; CS%col_j(col) = j
+          CS%col_i_GT(col) = i ; CS%col_j_GT(col) = j
           CS%Iresttime_col_GT(col) = Iresttime_GT_in(i,j)
           col = col + 1
         endif
       enddo ; enddo
     else 
+      allocate(CS%Iresttime_col(CS%num_col), source=0.0)
+      allocate(CS%col_i(CS%num_col), source=0)
+      allocate(CS%col_j(CS%num_col), source=0)
+      ! pass indices, restoring time to the CS structure
       do j=G%jsc,G%jec ; do i=G%isc,G%iec
         if ((Iresttime(i,j) > 0.0) .and. (G%mask2dT(i,j) > 0.0)) then
           CS%col_i(col) = i ; CS%col_j(col) = j
@@ -787,8 +826,14 @@ subroutine set_up_ALE_sponge_field_fixed(sp_val, G, GV, f_ptr, CS,  &
   CS%var(CS%fldno)%p => f_ptr
 
   if (present(which_iresttime)) then
+    ! write(mesg, '("which_iresttime is set to 1 for fldno ",I3," using different sponge for generic "//&
+    !    &" tracer variables." )') CS%fldno
+    write(mesg, '("Appling generic tracer sponge to feild number ",I3, "." )') CS%fldno
+    call MOM_error(warning,"set_up_ALE_sponge_field: which_iresttime is set to 1: "//mesg)
     CS%which_iresttime_col(CS%fldno) = which_iresttime
   else
+    write(mesg, '("Appling tracer sponge to feild number ",I3, "." )') CS%fldno
+    call MOM_error(warning,"set_up_ALE_sponge_field: which_iresttime is set to 0: "//mesg)
     CS%which_iresttime_col(CS%fldno) = 0 
   endif 
 
@@ -865,11 +910,14 @@ subroutine set_up_ALE_sponge_field_varying(filename, fieldname, Time, G, GV, US,
   CS%var(CS%fldno)%p => f_ptr
 
   if (present(which_iresttime)) then
-  !  write(mesg, '("which_iresttime is set to ",I3," using different sponge for generic "//&
-  !      &" tracer variables." )') which_iresttime 
-  !  call MOM_error(warning,"set_up_ALE_sponge_field: "//mesg)
+    ! write(mesg, '("which_iresttime is set to 1 for fldno ",I3," using different sponge for generic "//&
+    !    &" tracer variables." )') CS%fldno
+    write(mesg, '("Appling generic tracer sponge to feild number ",I3, "." )') CS%fldno
+    call MOM_error(warning,"set_up_ALE_sponge_field: which_iresttime is set to 1: "//mesg)
     CS%which_iresttime_col(CS%fldno) = which_iresttime
   else
+    write(mesg, '("Appling tracer sponge to feild number ",I3, "." )') CS%fldno
+    call MOM_error(warning,"set_up_ALE_sponge_field: which_iresttime is set to 0: "//mesg)
     CS%which_iresttime_col(CS%fldno) = 0 
   endif 
 
@@ -1090,7 +1138,9 @@ subroutine apply_ALE_sponge(h, tv, dt, G, GV, US, CS, Time)
     if (CS%id_sp_tendency(m) > 0) then
       allocate(tmp(G%isd:G%ied,G%jsd:G%jed,nz), source=0.0)
     endif
-    if (CS%which_iresttime_col(CS%fldno)==0) then
+    if (CS%which_iresttime_col(m)==0) then
+      write(mesg, '("Appling tracer sponge to feild number ",I3, "." )') m 
+      call MOM_error(Warning, "Applying tracer sponge."//mesg)
       do c=1,CS%num_col
         ! Set i and j to the structured indices of column c.
         i = CS%col_i(c) ; j = CS%col_j(c)
@@ -1119,8 +1169,8 @@ subroutine apply_ALE_sponge(h, tv, dt, G, GV, US, CS, Time)
         if (CS%id_sp_tendency(m) > 0) &
              tmp(i,j,1:CS%nz) = Idt*(CS%var(m)%p(i,j,1:nz) - tmp(i,j,1:nz))
       enddo
-    elseif (CS%which_iresttime_col(CS%fldno)==1) then
-      write(mesg, '("Appling generic tracer sponge to feild number ",I3, "." )') CS%fldno
+    elseif (CS%which_iresttime_col(m)==1) then
+      write(mesg, '("Appling generic tracer sponge to feild number ",I3, "." )') m 
       call MOM_error(Warning, "Applying generic tracer sponge."//mesg)
       do c=1,CS%num_col_GT
         ! Set i and j to the structured indices of column c.
