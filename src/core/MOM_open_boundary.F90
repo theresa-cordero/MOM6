@@ -6,7 +6,7 @@ module MOM_open_boundary
 use MOM_array_transform,      only : rotate_array, rotate_array_pair
 use MOM_coms,                 only : sum_across_PEs, Set_PElist, Get_PElist, PE_here, num_PEs
 use MOM_cpu_clock,            only : cpu_clock_id, cpu_clock_begin, cpu_clock_end, CLOCK_ROUTINE
-use MOM_debugging,            only : hchksum, uvchksum
+use MOM_debugging,            only : hchksum, uvchksum, chksum
 use MOM_diag_mediator,        only : diag_ctrl, time_type
 use MOM_domains,              only : pass_var, pass_vector
 use MOM_domains,              only : create_group_pass, do_group_pass, group_pass_type
@@ -18,7 +18,7 @@ use MOM_grid,                 only : ocean_grid_type, hor_index_type
 use MOM_interface_heights,    only : thickness_to_dz
 use MOM_interpolate,          only : init_external_field, time_interp_external, time_interp_external_init
 use MOM_interpolate,          only : external_field
-use MOM_io,                   only : slasher, field_size, file_exists, SINGLE_FILE
+use MOM_io,                   only : slasher, field_size, file_exists, stderr, SINGLE_FILE
 use MOM_io,                   only : vardesc, query_vardesc, var_desc
 use MOM_obsolete_params,      only : obsolete_logical, obsolete_int, obsolete_real, obsolete_char
 use MOM_regridding,           only : regridding_CS
@@ -72,6 +72,8 @@ public update_OBC_ramp
 public remap_OBC_fields
 public rotate_OBC_config
 public rotate_OBC_init
+public rotate_OBC_segment_direction
+public write_OBC_info, chksum_OBC_segments
 public initialize_segment_data
 public flood_fill
 public flood_fill2
@@ -444,13 +446,15 @@ subroutine open_boundary_config(G, US, param_file, OBC)
 
   ! Local variables
   integer :: l ! For looping over segments
-  logical :: debug, debug_OBC, mask_outside, reentrant_x, reentrant_y
+  logical :: debug, mask_outside, reentrant_x, reentrant_y
   character(len=15) :: segment_param_str ! The run-time parameter name for each segment
   character(len=1024) :: segment_str      ! The contents (rhs) for parameter "segment_param_str"
   character(len=200) :: config1          ! String for OBC_USER_CONFIG
   real               :: Lscale_in, Lscale_out ! parameters controlling tracer values at the boundaries [L ~> m]
   integer :: default_answer_date  ! The default setting for the various ANSWER_DATE flags.
   logical :: check_remapping, force_bounds_in_subcell
+  logical :: debugging_tests ! If true, do additional calls resetting values to help debug the performance
+                             ! of the open boundary condition code.
   logical :: om4_remap_via_sub_cells ! If true, use the OM4 remapping algorithm
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
@@ -547,21 +551,25 @@ subroutine open_boundary_config(G, US, param_file, OBC)
     endif
 
     call get_param(param_file, mdl, "DEBUG", debug, default=.false.)
-    ! This extra get_param call is to enable logging if either DEBUG or DEBUG_OBC are true.
-    call get_param(param_file, mdl, "DEBUG_OBC", debug_OBC, default=debug)
-    call get_param(param_file, mdl, "DEBUG_OBC", OBC%debug, &
+    call get_param(param_file, mdl, "DEBUG_OBCS", OBC%debug, &
                  "If true, do additional calls to help debug the performance "//&
                  "of the open boundary condition code.", &
-                 default=debug, do_not_log=.not.(debug_OBC.or.debug), debuggingParam=.true.)
+                 default=.false., debuggingParam=.true.)
+    if (OBC%debug .and. (num_PEs() > 1)) &
+      call MOM_error(FATAL, "DEBUG_OBCS = True is currently only supported for single PE runs.")
+    call get_param(param_file, mdl, "OBC_DEBUGGING_TESTS", debugging_tests, &
+                 "If true, do additional calls resetting certain values to help verify the correctness "//&
+                 "of the open boundary condition code.", &
+                 default=.false., old_name="DEBUG_OBC", debuggingParam=.true.)
 
     call get_param(param_file, mdl, "OBC_SILLY_THICK", OBC%silly_h, &
                  "A silly value of thicknesses used outside of open boundary "//&
                  "conditions for debugging.", units="m", default=0.0, scale=US%m_to_Z, &
-                 do_not_log=.not.OBC%debug, debuggingParam=.true.)
+                 do_not_log=.not.debugging_tests, debuggingParam=.true.)
     call get_param(param_file, mdl, "OBC_SILLY_VEL", OBC%silly_u, &
                  "A silly value of velocities used outside of open boundary "//&
                  "conditions for debugging.", units="m/s", default=0.0, scale=US%m_s_to_L_T, &
-                 do_not_log=.not.OBC%debug, debuggingParam=.true.)
+                 do_not_log=.not.debugging_tests, debuggingParam=.true.)
     call get_param(param_file, mdl, "EXTERIOR_OBC_BUG", OBC%exterior_OBC_bug, &
                  "If true, recover a bug in barotropic solver and other routines when "//&
                  "boundary contitions interior to the domain are used.", &
@@ -3382,22 +3390,22 @@ subroutine radiation_open_bdry_conds(OBC, u_new, u_old, v_new, v_old, G, GV, US,
     sym = G%Domain%symmetric
     if (OBC%radiation_BCs_exist_globally) then
       call uvchksum("radiation_OBCs: OBC%r[xy]_normal", OBC%rx_normal, OBC%ry_normal, G%HI, &
-                  haloshift=0, symmetric=sym, unscale=1.0)
+                  haloshift=0, symmetric=sym, scalar_pair=.true., unscale=1.0)
     endif
     if (OBC%oblique_BCs_exist_globally) then
       call uvchksum("radiation_OBCs: OBC%r[xy]_oblique_[uv]", OBC%rx_oblique_u, OBC%ry_oblique_v, G%HI, &
-                  haloshift=0, symmetric=sym, unscale=1.0/US%L_T_to_m_s**2)
+                  haloshift=0, symmetric=sym, scalar_pair=.true., unscale=1.0/US%L_T_to_m_s**2)
       call uvchksum("radiation_OBCs: OBC%r[yx]_oblique_[uv]", OBC%ry_oblique_u, OBC%rx_oblique_v, G%HI, &
-                  haloshift=0, symmetric=sym, unscale=1.0/US%L_T_to_m_s**2)
+                  haloshift=0, symmetric=sym, scalar_pair=.true., unscale=1.0/US%L_T_to_m_s**2)
       call uvchksum("radiation_OBCs: OBC%cff_normal_[uv]", OBC%cff_normal_u, OBC%cff_normal_v, G%HI, &
-                  haloshift=0, symmetric=sym, unscale=1.0/US%L_T_to_m_s**2)
+                  haloshift=0, symmetric=sym, scalar_pair=.true., unscale=1.0/US%L_T_to_m_s**2)
     endif
     if (OBC%ntr == 0) return
     if (.not. associated (OBC%tres_x) .or. .not. associated (OBC%tres_y)) return
     do m=1,OBC%ntr
       write(var_num,'(I3.3)') m
       call uvchksum("radiation_OBCs: OBC%tres_[xy]_"//var_num, OBC%tres_x(:,:,:,m), OBC%tres_y(:,:,:,m), G%HI, &
-                    haloshift=0, symmetric=sym, unscale=1.0)
+                    haloshift=0, symmetric=sym, scalar_pair=.true., unscale=1.0)
     enddo
   endif
 
@@ -6028,36 +6036,64 @@ subroutine rotate_OBC_segment_config(segment_in, G_in, segment, G, turns)
   endif
 
   ! Reconfigure the directional flags
-  ! TODO: This is hardcoded for 90 degrees, and needs to be generalized.
-  select case (segment_in%direction)
-    case (OBC_DIRECTION_N)
-      segment%direction = OBC_DIRECTION_W
-      segment%is_E_or_W_2 = segment_in%is_N_or_S
-      segment%is_E_or_W = segment_in%is_N_or_S .and. segment_in%on_pe
-      segment%is_N_or_S = .false.
-    case (OBC_DIRECTION_W)
-      segment%direction = OBC_DIRECTION_S
-      segment%is_N_or_S = segment_in%is_E_or_W
-      segment%is_E_or_W = .false.
-      segment%is_E_or_W_2 = .false.
-    case (OBC_DIRECTION_S)
-      segment%direction = OBC_DIRECTION_E
-      segment%is_E_or_W_2 = segment_in%is_N_or_S
-      segment%is_E_or_W = segment_in%is_N_or_S .and. segment_in%on_pe
-      segment%is_N_or_S = .false.
-    case (OBC_DIRECTION_E)
-      segment%direction = OBC_DIRECTION_N
-      segment%is_N_or_S = segment_in%is_E_or_W
-      segment%is_E_or_W = .false.
-      segment%is_E_or_W_2 = .false.
-    case (OBC_NONE)
-      segment%direction = OBC_NONE
-  end select
+  segment%direction = rotate_OBC_segment_direction(segment_in%direction, turns)
+
+  segment%is_E_or_W_2 = ((segment%direction == OBC_DIRECTION_E) .or. &
+                         (segment%direction == OBC_DIRECTION_W))
+  segment%is_E_or_W = segment_in%on_PE .and. segment%is_E_or_W_2
+  segment%is_N_or_S = segment_in%on_PE .and. &
+                        ((segment%direction == OBC_DIRECTION_N) .or. &
+                         (segment%direction == OBC_DIRECTION_S))
 
   ! These are conditionally set if Lscale_{in,out} are present
   segment%Tr_InvLscale_in = segment_in%Tr_InvLscale_in
   segment%Tr_InvLscale_out = segment_in%Tr_InvLscale_out
 end subroutine rotate_OBC_segment_config
+
+
+!> Return the direction of an OBC segment on after rotation to the new grid.  Note that
+!! rotate_OBC_seg_direction(rotate_OBC_seg_direction(direction, turns), -turns) = direction.
+function rotate_OBC_segment_direction(direction, turns) result(rotated_dir)
+  integer, intent(in) :: direction  !< The orientation of an OBC segment on the original grid
+  integer, intent(in) :: turns      !< Number of quarter turns
+  integer :: rotated_dir  !< An integer encoding the new rotated segment direction
+
+  integer :: qturns ! The number of quarter turns in the range of 0 to 3
+
+  qturns = modulo(turns, 4)
+
+  if ((qturns == 0) .or. (direction == OBC_NONE)) then
+    rotated_dir = direction
+  else  ! Determine the segment direction on a rotated grid
+    select case (direction)
+      case (OBC_DIRECTION_N)
+        if (qturns == 0) rotated_dir = OBC_DIRECTION_N
+        if (qturns == 1) rotated_dir = OBC_DIRECTION_W
+        if (qturns == 2) rotated_dir = OBC_DIRECTION_S
+        if (qturns == 3) rotated_dir = OBC_DIRECTION_E
+      case (OBC_DIRECTION_W)
+        if (qturns == 0) rotated_dir = OBC_DIRECTION_W
+        if (qturns == 1) rotated_dir = OBC_DIRECTION_S
+        if (qturns == 2) rotated_dir = OBC_DIRECTION_E
+        if (qturns == 3) rotated_dir = OBC_DIRECTION_N
+      case (OBC_DIRECTION_S)
+        if (qturns == 0) rotated_dir = OBC_DIRECTION_S
+        if (qturns == 1) rotated_dir = OBC_DIRECTION_E
+        if (qturns == 2) rotated_dir = OBC_DIRECTION_N
+        if (qturns == 3) rotated_dir = OBC_DIRECTION_W
+      case (OBC_DIRECTION_E)
+        if (qturns == 0) rotated_dir = OBC_DIRECTION_E
+        if (qturns == 1) rotated_dir = OBC_DIRECTION_N
+        if (qturns == 2) rotated_dir = OBC_DIRECTION_W
+        if (qturns == 3) rotated_dir = OBC_DIRECTION_S
+      case (OBC_NONE)
+        rotated_dir = OBC_NONE
+      case default ! This should never happen.
+        rotated_dir = direction
+    end select
+  endif
+
+end function rotate_OBC_segment_direction
 
 
 !> Initialize the segments and field-related data of a rotated OBC.
@@ -6283,6 +6319,362 @@ subroutine allocate_rotated_seg_data(src_array, HI_in, tgt_array, segment)
     allocate(tgt_array(isd:ied,JsdB:JedB,nk), source=0.0)
   endif
 end subroutine allocate_rotated_seg_data
+
+
+!> Write out information about the contents of the OBC control structure
+subroutine write_OBC_info(OBC, G, GV, US)
+  type(ocean_OBC_type),    pointer    :: OBC   !< An open boundary condition control structure
+  type(ocean_grid_type),   intent(in) :: G     !< Rotated grid metric
+  type(verticalGrid_type), intent(in) :: GV    !< Vertical grid
+  type(unit_scale_type),   intent(in) :: US    !< Unit scaling
+
+  ! Local variables
+  type(OBC_segment_type), pointer :: segment => NULL() ! pointer to segment type list
+  integer :: turns    ! Number of index quarter turns
+  integer :: c, n, dir, unrot_dir
+  character(len=1024) :: mesg
+
+  turns = modulo(G%HI%turns, 4)
+
+  write(mesg, '("OBC has ", I3, " segments.")') OBC%number_of_segments
+  call MOM_mesg(mesg, verb=1)
+  !  call MOM_error(WARNING, mesg)
+
+  if (modulo(turns, 2) == 0) then
+    if (OBC%open_u_BCs_exist_globally) call MOM_mesg("open_u_BCs_exist_globally", verb=1)
+    if (OBC%open_v_BCs_exist_globally) call MOM_mesg("open_v_BCs_exist_globally", verb=1)
+    if (OBC%Flather_u_BCs_exist_globally) call MOM_mesg("Flather_u_BCs_exist_globally", verb=1)
+    if (OBC%Flather_v_BCs_exist_globally) call MOM_mesg("Flather_v_BCs_exist_globally", verb=1)
+    if (OBC%nudged_u_BCs_exist_globally) call MOM_mesg("nudged_u_BCs_exist_globally", verb=1)
+    if (OBC%nudged_v_BCs_exist_globally) call MOM_mesg("nudged_v_BCs_exist_globally", verb=1)
+    if (OBC%specified_u_BCs_exist_globally) call MOM_mesg("specified_u_BCs_exist_globally", verb=1)
+    if (OBC%specified_v_BCs_exist_globally) call MOM_mesg("specified_v_BCs_exist_globally", verb=1)
+  else  ! The u- and v-directions are swapped.
+    if (OBC%open_v_BCs_exist_globally) call MOM_mesg("open_u_BCs_exist_globally", verb=1)
+    if (OBC%open_u_BCs_exist_globally) call MOM_mesg("open_v_BCs_exist_globally", verb=1)
+    if (OBC%Flather_v_BCs_exist_globally) call MOM_mesg("Flather_u_BCs_exist_globally", verb=1)
+    if (OBC%Flather_u_BCs_exist_globally) call MOM_mesg("Flather_v_BCs_exist_globally", verb=1)
+    if (OBC%nudged_v_BCs_exist_globally) call MOM_mesg("nudged_u_BCs_exist_globally", verb=1)
+    if (OBC%nudged_u_BCs_exist_globally) call MOM_mesg("nudged_v_BCs_exist_globally", verb=1)
+    if (OBC%specified_v_BCs_exist_globally) call MOM_mesg("specified_u_BCs_exist_globally", verb=1)
+    if (OBC%specified_u_BCs_exist_globally) call MOM_mesg("specified_v_BCs_exist_globally", verb=1)
+  endif
+
+  if (OBC%oblique_BCs_exist_globally) call MOM_mesg("oblique_BCs_exist_globally", verb=1)
+  if (OBC%radiation_BCs_exist_globally) call MOM_mesg("radiation_BCs_exist_globally", verb=1)
+  if (OBC%user_BCs_set_globally) call MOM_mesg("user_BCs_set_globally", verb=1)
+  if (OBC%update_OBC) call MOM_mesg("update_OBC", verb=1)
+  if (OBC%update_OBC_seg_data) call MOM_mesg("update_OBC_seg_data", verb=1)
+  if (OBC%needs_IO_for_data) call MOM_mesg("needs_IO_for_data", verb=1)
+  if (OBC%any_needs_IO_for_data) call MOM_mesg("any_needs_IO_for_data", verb=1)
+  if (OBC%zero_vorticity) call MOM_mesg("zero_vorticity", verb=1)
+  if (OBC%freeslip_vorticity) call MOM_mesg("freeslip_vorticity", verb=1)
+  if (OBC%computed_vorticity) call MOM_mesg("computed_vorticity", verb=1)
+  if (OBC%specified_vorticity) call MOM_mesg("specified_vorticity", verb=1)
+  if (OBC%zero_strain) call MOM_mesg("zero_strain", verb=1)
+  if (OBC%freeslip_strain) call MOM_mesg("freeslip_strain", verb=1)
+  if (OBC%computed_strain) call MOM_mesg("computed_strain", verb=1)
+  if (OBC%specified_strain) call MOM_mesg("specified_strain", verb=1)
+  if (OBC%zero_biharmonic) call MOM_mesg("zero_biharmonic", verb=1)
+  if (OBC%brushcutter_mode) call MOM_mesg("brushcutter_mode", verb=1)
+  if (OBC%check_reconstruction) call MOM_mesg("check_reconstruction", verb=1)
+  if (OBC%check_remapping) call MOM_mesg("check_remapping", verb=1)
+  if (OBC%force_bounds_in_subcell) call MOM_mesg("force_bounds_in_subcell", verb=1)
+  if (OBC%om4_remap_via_sub_cells) call MOM_mesg("om4_remap_via_sub_cells", verb=1)
+  if (OBC%exterior_OBC_bug) call MOM_mesg("exterior_OBC_bug", verb=1)
+  if (OBC%debug) call MOM_mesg("debug", verb=1)
+  if (OBC%ramp) call MOM_mesg("ramp", verb=1)
+  if (OBC%ramping_is_activated) call MOM_mesg("ramping_is_activated", verb=1)
+  write(mesg, '("n_tide_constituents ", I3)') OBC%n_tide_constituents
+  call MOM_mesg(mesg, verb=1)
+  if (OBC%n_tide_constituents > 0) then
+    do c=1,OBC%n_tide_constituents
+      write(mesg, '(" properties ", 4ES16.6)') &
+            US%s_to_T*OBC%tide_frequencies(c), OBC%tide_eq_phases(c), OBC%tide_fn(c), OBC%tide_un(c)
+      call MOM_mesg(trim(OBC%tide_names(c))//mesg, verb=1)
+    enddo
+  endif
+  if (OBC%ramp) then
+    write(mesg, '("ramp_values ", 3ES16.6)') OBC%ramp_timescale, OBC%trunc_ramp_time, OBC%ramp_value
+    call MOM_mesg(mesg, verb=1)
+  endif
+  write(mesg, '("gamma_uv ", ES16.6)') OBC%gamma_uv
+  call MOM_mesg(mesg, verb=1)
+  write(mesg, '("rx_max ", ES16.6)') OBC%rx_max
+  call MOM_mesg(mesg, verb=1)
+
+  call MOM_mesg("remappingScheme = "//trim(OBC%remappingScheme), verb=1)
+
+  do n=1,OBC%number_of_segments
+    segment => OBC%segment(n)
+    dir = segment%direction
+
+    unrot_dir = rotate_OBC_segment_direction(dir, -turns)
+    write(mesg, '(" Segment ", I3, " has direction ", I3)') n, unrot_dir
+    if (unrot_dir == OBC_DIRECTION_N)  write(mesg, '(" Segment ", I3, " is Northern")') n
+    if (unrot_dir == OBC_DIRECTION_S)  write(mesg, '(" Segment ", I3, " is Southern")') n
+    if (unrot_dir == OBC_DIRECTION_E)  write(mesg, '(" Segment ", I3, " is Eastern")') n
+    if (unrot_dir == OBC_DIRECTION_W)  write(mesg, '(" Segment ", I3, " is Western")') n
+    call MOM_mesg(mesg, verb=1)
+
+    ! write(mesg, '("  range: ", 4I3)') segment%Is_obc, segment%Ie_obc, segment%Js_obc, segment%Je_obc
+    if (modulo(turns, 2) == 0) then
+      write(mesg, '("  size: ", 4I3)') 1+abs(segment%Ie_obc-segment%Is_obc), 1+abs(segment%Je_obc-segment%Js_obc)
+    else
+      write(mesg, '("  size: ", 4I3)') 1+abs(segment%Je_obc-segment%Js_obc), 1+abs(segment%Ie_obc-segment%Is_obc)
+    endif
+    call MOM_mesg(mesg, verb=1)
+
+    if (segment%on_pe)          call MOM_mesg("  Segment is on PE.", verb=1)
+
+    if (segment%Flather)        call MOM_mesg("  Flather", verb=1)
+    if (segment%radiation)      call MOM_mesg("  radiation", verb=1)
+    if (segment%radiation_tan)  call MOM_mesg("  radiation_tan", verb=1)
+    if (segment%radiation_grad) call MOM_mesg("  radiation_grad", verb=1)
+    if (segment%oblique)        call MOM_mesg("  oblique", verb=1)
+    if (segment%oblique_tan)    call MOM_mesg("  oblique_tan", verb=1)
+    if (segment%oblique_grad)   call MOM_mesg("  oblique_grad", verb=1)
+    if (segment%nudged)         call MOM_mesg("  nudged", verb=1)
+    if (segment%nudged_tan)     call MOM_mesg("  nudged_tan", verb=1)
+    if (segment%nudged_grad)    call MOM_mesg("  nudged_grad", verb=1)
+    if (segment%specified)      call MOM_mesg("  specified", verb=1)
+    if (segment%specified_tan)  call MOM_mesg("  specified_tan", verb=1)
+    if (segment%specified_grad) call MOM_mesg("  specified_grad", verb=1)
+    if (segment%open)           call MOM_mesg("  open", verb=1)
+    if (segment%gradient)       call MOM_mesg("  gradient", verb=1)
+    if (segment%values_needed)  call MOM_mesg("  values_needed", verb=1)
+    if (modulo(turns, 2) == 0) then
+      if (segment%is_N_or_S)      call MOM_mesg("  is_N_or_S", verb=1)
+      if (segment%is_E_or_W)      call MOM_mesg("  is_E_or_W", verb=1)
+      if (segment%u_values_needed) call MOM_mesg("  u_values_needed", verb=1)
+      if (segment%uamp_values_needed) call MOM_mesg("  uamp_values_needed", verb=1)
+      if (segment%uphase_values_needed) call MOM_mesg("  uphase_values_needed", verb=1)
+      if (segment%v_values_needed) call MOM_mesg("  v_values_needed", verb=1)
+      if (segment%vamp_values_needed) call MOM_mesg("  vamp_values_needed", verb=1)
+      if (segment%vphase_values_needed) call MOM_mesg("  vphase_values_needed", verb=1)
+    else  ! The x- and y-directions are swapped.
+      if (segment%is_E_or_W)      call MOM_mesg("  is_N_or_S", verb=1)
+      if (segment%is_N_or_S)      call MOM_mesg("  is_E_or_W", verb=1)
+      if (segment%v_values_needed) call MOM_mesg("  u_values_needed", verb=1)
+      if (segment%vamp_values_needed) call MOM_mesg("  uamp_values_needed", verb=1)
+      if (segment%vphase_values_needed) call MOM_mesg("  uphase_values_needed", verb=1)
+      if (segment%u_values_needed) call MOM_mesg("  v_values_needed", verb=1)
+      if (segment%uamp_values_needed) call MOM_mesg("  vamp_values_needed", verb=1)
+      if (segment%uphase_values_needed) call MOM_mesg("  vphase_values_needed", verb=1)
+    endif
+    if (segment%t_values_needed) call MOM_mesg("  t_values_needed", verb=1)
+    if (segment%s_values_needed) call MOM_mesg("  s_values_needed", verb=1)
+    if (segment%z_values_needed) call MOM_mesg("  z_values_needed", verb=1)
+    if (segment%zamp_values_needed) call MOM_mesg("  zamp_values_needed", verb=1)
+    if (segment%zphase_values_needed) call MOM_mesg("  zphase_values_needed", verb=1)
+    if (segment%g_values_needed) call MOM_mesg("  g_values_needed", verb=1)
+!    if (segment%is_E_or_W_2)    call MOM_mesg("  is_E_or_W_2", verb=1)
+    if (segment%temp_segment_data_exists) call MOM_mesg("  temp_segment_data_exists", verb=1)
+    if (segment%salt_segment_data_exists) call MOM_mesg("  salt_segment_data_exists", verb=1)
+
+    write(mesg, '("  Tr_InvLscale_out ", ES16.6)') segment%Tr_InvLscale_out*US%m_to_L
+    call MOM_mesg(mesg, verb=1)
+    write(mesg, '("  Tr_InvLscale_in ", ES16.6)') segment%Tr_InvLscale_in*US%m_to_L
+    call MOM_mesg(mesg, verb=1)
+
+  enddo
+
+  call chksum_OBC_segments(OBC, G, GV, US, 0)
+
+end subroutine write_OBC_info
+
+!> Write checksums and perhaps the values of all the allocated arrays on an OBC segments.
+subroutine chksum_OBC_segments(OBC, G, GV, US, nk)
+  type(ocean_OBC_type),    pointer    :: OBC   !< OBC on input map
+  type(ocean_grid_type),   intent(in) :: G     !< Rotated grid metric
+  type(verticalGrid_type), intent(in) :: GV    !< Vertical grid
+  type(unit_scale_type),   intent(in) :: US    !< Unit scaling
+  integer,                 intent(in) :: nk    !< The number of layers to print
+
+  ! Local variables
+  type(OBC_segment_type), pointer :: segment => NULL() ! pointer to segment type list
+  real :: norm ! A sign change used when rotating a normal component [nondim]
+  real :: tang ! A sign change used when rotating a tangential component [nondim]
+  character(len=8) :: sn, segno
+  character(len=1024) :: mesg
+  integer :: c, n, dir
+
+  do n=1,OBC%number_of_segments
+    segment => OBC%segment(n)
+    dir = segment%direction
+
+    write(segno, '(I3)') n
+    sn = '('//trim(adjustl(segno))//')'
+
+    ! Turn each segment and write it as though it is an eastern face.
+    norm = 0.0 ; tang = 0.0
+    if (dir == OBC_DIRECTION_E) then
+      norm = 1.0 ; tang = 1.0
+    elseif (dir == OBC_DIRECTION_N) then
+      norm = 1.0 ; tang = -1.0
+    elseif (dir == OBC_DIRECTION_W) then
+      norm = -1.0 ; tang = -1.0
+    elseif (dir == OBC_DIRECTION_S) then
+      norm = -1.0 ; tang = 1.0
+    endif
+
+    if (allocated(segment%Cg)) call write_2d_array_vals("Cg"//trim(sn), segment%Cg, dir, nk, unscale=US%L_T_to_m_s)
+    if (allocated(segment%Htot)) call write_2d_array_vals("Htot"//trim(sn), segment%Htot, dir, nk, unscale=GV%H_to_mks)
+    if (allocated(segment%dZtot)) call write_2d_array_vals("dZtot"//trim(sn), segment%dZtot, dir, nk, unscale=US%Z_to_m)
+    if (allocated(segment%SSH)) call write_2d_array_vals("SSH"//trim(sn), segment%SSH, dir, nk, unscale=US%Z_to_m)
+    if (allocated(segment%h)) call write_3d_array_vals("h"//trim(sn), segment%h, dir, nk, unscale=GV%H_to_mks)
+    if (allocated(segment%normal_vel)) &
+      call write_3d_array_vals("normal_vel"//trim(sn), segment%normal_vel, dir, nk, unscale=norm*US%L_T_to_m_s)
+    if (allocated(segment%normal_vel_bt)) &
+      call write_2d_array_vals("normal_vel_bt"//trim(sn), segment%normal_vel_bt, dir, nk, unscale=norm*US%L_T_to_m_s)
+    if (allocated(segment%tangential_vel)) &
+      call write_3d_array_vals("tangential_vel"//trim(sn), segment%tangential_vel, dir, nk, unscale=tang*US%L_T_to_m_s)
+    if (allocated(segment%tangential_grad)) &
+      call write_3d_array_vals("tangential_grad"//trim(sn), segment%tangential_grad, dir, nk, &
+                    unscale=tang*norm*US%s_to_T)
+    if (allocated(segment%normal_trans)) &
+      call write_3d_array_vals("normal_trans"//trim(sn), segment%normal_trans, dir, nk, &
+                    unscale=norm*GV%H_to_mks*US%L_T_to_m_s*US%L_to_m)
+    if (allocated(segment%grad_normal)) &
+      call write_3d_array_vals("grad_normal"//trim(sn), segment%grad_normal, dir, nk, unscale=norm*tang*US%L_T_to_m_s)
+    if (allocated(segment%grad_tan)) &
+      call write_3d_array_vals("grad_tan"//trim(sn), segment%grad_tan, dir, nk, unscale=1.0*US%L_T_to_m_s)
+    if (allocated(segment%grad_gradient)) &
+      call write_3d_array_vals("grad_gradient"//trim(sn), segment%grad_gradient, dir, nk, unscale=norm*US%s_to_T)
+
+    if (allocated(segment%rx_norm_rad)) &
+      call write_3d_array_vals("rxy_norm_rad"//trim(sn), segment%rx_norm_rad, dir, nk, unscale=1.0)
+    if (allocated(segment%ry_norm_rad)) &
+      call write_3d_array_vals("rxy_norm_rad"//trim(sn), segment%ry_norm_rad, dir, nk, unscale=1.0)
+    if (segment%is_E_or_W) then
+      if (allocated(segment%rx_norm_obl)) &
+        call write_3d_array_vals("rx_norm_obl"//trim(sn), segment%rx_norm_obl, dir, nk, unscale=US%L_T_to_m_s**2)
+      if (allocated(segment%ry_norm_obl)) &
+        call write_3d_array_vals("ry_norm_obl"//trim(sn), segment%ry_norm_obl, dir, nk, unscale=US%L_T_to_m_s**2)
+    else ! The x- and y- directions are swapped.
+      if (allocated(segment%ry_norm_obl)) &
+        call write_3d_array_vals("rx_norm_obl"//trim(sn), segment%ry_norm_obl, dir, nk, unscale=US%L_T_to_m_s**2)
+      if (allocated(segment%rx_norm_obl)) &
+        call write_3d_array_vals("ry_norm_obl"//trim(sn), segment%rx_norm_obl, dir, nk, unscale=US%L_T_to_m_s**2)
+    endif
+
+    if (allocated(segment%cff_normal)) &
+      call write_3d_array_vals("cff_normal"//trim(sn), segment%cff_normal, dir, nk, unscale=US%L_T_to_m_s**2)
+    if (allocated(segment%nudged_normal_vel)) &
+      call write_3d_array_vals("nudged_normal_vel"//trim(sn), segment%nudged_normal_vel, dir, nk, &
+                    unscale=norm*US%L_T_to_m_s)
+    if (allocated(segment%nudged_tangential_vel)) &
+      call write_3d_array_vals("nudged_tangential_vel"//trim(sn), segment%nudged_tangential_vel, dir, nk, &
+                    unscale=tang*US%L_T_to_m_s)
+    if (allocated(segment%nudged_tangential_grad)) &
+      call write_3d_array_vals("nudged_tangential_grad"//trim(sn), segment%nudged_tangential_grad, dir, nk, &
+                    unscale=tang*norm*US%s_to_T)
+  enddo
+
+  contains
+
+  !> Write out the values in a named 2-d segment data array
+  subroutine write_2d_array_vals(name, Array, seg_dir, nkp, unscale)
+    character(len=*),     intent(in) :: name    !< The name of the variable
+    real, dimension(:,:), intent(in) :: Array   !< The 2-d array to write [A ~> a]
+    integer,              intent(in) :: seg_dir !< The direction of the segment
+    integer,              intent(in) :: nkp     !< Print all the values if this is greater than 0
+    real,       optional, intent(in) :: unscale !< A factor that undoes the scaling of the array [a A-1 ~> 1]
+    ! Local variables
+    real :: scale  !  A factor that undoes the scaling of the array [a A-1 ~> 1]
+    character(len=1024) :: mesg
+    character(len=24) :: val
+    integer :: i, j, n, iounit
+
+    scale = 1.0 ; if (present(unscale)) scale = unscale
+    iounit = stderr
+
+    if (nkp > 0) then
+      write(iounit, '(2X,A,":")') trim(name)
+      mesg = "" ; n = 0
+      if ((seg_dir == OBC_DIRECTION_N) .or. (seg_dir == OBC_DIRECTION_W)) then
+        do j=size(Array,2),1,-1 ; do i=size(Array,1),1,-1
+          write(val, '(ES16.6)') scale*Array(i,j)
+          mesg = trim(mesg)//" "//trim(val) ;  n = n + 1
+          if (n >= 12) then
+            write(iounit, '(2X,A)') trim(mesg)
+            mesg = "" ; n = 0
+          endif
+        enddo ; enddo
+      else
+        do j=1,size(Array,2) ; do i=1,size(Array,1)
+          write(val, '(ES16.6)') scale*Array(i,j)
+          mesg = trim(mesg)//" "//trim(val) ;  n = n + 1
+          if (n >= 12) then
+            write(iounit, '(2X,A)') trim(mesg)
+            mesg = "" ; n = 0
+          endif
+        enddo ; enddo
+      endif
+      if (n > 0) write(iounit, '(2X,A)') trim(mesg)
+    endif
+
+    if (scale == 1.0) then
+      call chksum(Array, name)
+    else
+      call chksum(scale*Array(:,:), name)
+    endif
+  end subroutine write_2d_array_vals
+
+  !> Write out the values in a 3-d segment data array
+  subroutine write_3d_array_vals(name, Array, seg_dir, nkp, unscale)
+    character(len=*),       intent(in) :: name    !< The name of the variable
+    real, dimension(:,:,:), intent(in) :: Array   !< The 3-d array to write
+    integer,                intent(in) :: seg_dir !< The direction of the segment
+    integer,                intent(in) :: nkp     !< The number of layers to print
+    real,         optional, intent(in) :: unscale !< A factor that undoes the scaling of the array [a A-1 ~> 1]
+    ! Local variables
+    real :: scale  !  A factor that undoes the scaling of the array [a A-1 ~> 1]
+    logical :: reverse
+    character(len=1024) :: mesg
+    character(len=24) :: val
+    integer :: i, j, k, n, nk, iounit
+
+    scale = 1.0 ; if (present(unscale)) scale = unscale
+    iounit = stderr
+
+    if (nkp > 0) then
+      nk = min(nkp, size(Array,3))
+      write(iounit, '(2X,A,":")') trim(name)
+      do k=1,nk
+        mesg = "" ; n = 0
+        if ((seg_dir == OBC_DIRECTION_N) .or. (seg_dir == OBC_DIRECTION_W)) then
+          do j=size(Array,2),1,-1 ; do i=size(Array,1),1,-1
+            write(val, '(ES16.6)') scale*Array(i,j,k)
+            mesg = trim(mesg)//" "//trim(val) ; n = n + 1
+            if (n >= 12) then
+              write(iounit, '(2X,A)') trim(mesg)
+              mesg = "" ; n = 0
+            endif
+          enddo ; enddo
+        else
+          do j=1,size(Array,2) ; do i=1,size(Array,1)
+            write(val, '(ES16.6)') scale*Array(i,j,k)
+            mesg = trim(mesg)//" "//trim(val) ; n = n + 1
+            if (n >= 12) then
+              write(iounit, '(2X,A)') trim(mesg)
+              mesg = "" ; n = 0
+            endif
+          enddo ; enddo
+        endif
+        if (n > 0) write(iounit, '(2X,A)') trim(mesg)
+      enddo
+    endif
+
+    if (scale == 1.0) then
+      call chksum(Array, name)
+    else
+      call chksum(scale*Array(:,:,:), name)
+    endif
+
+  end subroutine write_3d_array_vals
+
+end subroutine chksum_OBC_segments
 
 !> \namespace mom_open_boundary
 !! This module implements some aspects of internal open boundary
