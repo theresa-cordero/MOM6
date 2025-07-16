@@ -138,7 +138,7 @@ type, public :: barotropic_CS ; private
           !< The difference between the free surface height from the barotropic calculation and the sum
           !! of the layer thicknesses. This difference is imposed as a forcing term in the barotropic
           !! calculation over a baroclinic timestep [H ~> m or kg m-2].
-  real ALLOCABLE_, dimension(NIMEM_,NJMEM_) :: eta_cor_bound
+  real, allocatable, dimension(:,:) :: eta_cor_bound
           !< A limit on the rate at which eta_cor can be applied while avoiding instability
           !! [H T-1 ~> m s-1 or kg m-2 s-1]. This is only used if CS%bound_BT_corr is true.
   real ALLOCABLE_, dimension(NIMEMW_,NJMEMW_) :: &
@@ -4032,8 +4032,7 @@ subroutine initialize_BT_OBC(OBC, BT_OBC, G, CS)
   real, dimension(SZIW_(CS),SZJBW_(CS)) :: &
     v_OBC        ! A set of integers encoding the nature of the v-point open boundary conditions,
                  ! converted to real numbers to work with the MOM6 halo update code [nondim]
-  real :: OBC_sign  ! A sign encoding the direction of the OBC being used at a point [nondim]
-  real :: OBC_type  ! A real copy of the integer encoding the type of OBC being used at a point [nondim]
+  integer :: OBC_type  ! The integer encoding the type of OBC being used at a point [nondim]
   logical :: reversed_OBCs  ! True of there any OBCs in the opposite halo on this PE, e.g. points
                             ! with a southern OBC in a northern halo.
   logical :: any_reversed_OBCs
@@ -4046,30 +4045,26 @@ subroutine initialize_BT_OBC(OBC, BT_OBC, G, CS)
   v_OBC(:,:) = 0.0
 
   do j=G%jsc,G%jec ; do I=G%isc-1,G%iec
-    l_seg = OBC%segnum_u(I,j)
 
-    OBC_sign = 0.0 ; OBC_type = 0.0
-    if (l_seg /= OBC_NONE) then
-      if (OBC%segment(l_seg)%direction == OBC_DIRECTION_E) OBC_sign = 1.0
-      if (OBC%segment(l_seg)%direction == OBC_DIRECTION_W) OBC_sign = -1.0
+    OBC_type = 0
+    if (OBC%segnum_u(I,j) /= 0) then
+      l_seg = abs(OBC%segnum_u(I,j))
       if (OBC%segment(l_seg)%gradient) OBC_type = GRADIENT_OBC
       if (OBC%segment(l_seg)%Flather) OBC_type = FLATHER_OBC
       if (OBC%segment(l_seg)%specified) OBC_type = SPECIFIED_OBC
+      u_OBC(I,j) = sign(OBC_type, OBC%segnum_u(I,j))
     endif
-    u_OBC(I,j) = OBC_sign * OBC_type
   enddo ; enddo
 
   do J=G%jsc-1,G%jec ; do i=G%isc,G%iec
-    l_seg = OBC%segnum_v(i,J)
-    OBC_sign = 0.0 ; OBC_type = 0.0
-    if (l_seg /= OBC_NONE) then
-      if (OBC%segment(l_seg)%direction == OBC_DIRECTION_N) OBC_sign = 1.0
-      if (OBC%segment(l_seg)%direction == OBC_DIRECTION_S) OBC_sign = -1.0
+    OBC_type = 0
+    if (OBC%segnum_v(i,J) /= 0) then
+      l_seg = abs(OBC%segnum_v(i,J))
       if (OBC%segment(l_seg)%gradient) OBC_type = GRADIENT_OBC
       if (OBC%segment(l_seg)%Flather) OBC_type = FLATHER_OBC
       if (OBC%segment(l_seg)%specified) OBC_type = SPECIFIED_OBC
+      v_OBC(i,J) = sign(OBC_type, OBC%segnum_v(i,J))
     endif
-    v_OBC(i,J) = OBC_sign * OBC_type
   enddo ; enddo
 
   call pass_vector(u_OBC, v_OBC, CS%BT_Domain)
@@ -5738,9 +5733,8 @@ subroutine barotropic_init(u, v, h, Time, G, GV, US, param_file, diag, CS, &
 
   ALLOC_(CS%frhatu(IsdB:IedB,jsd:jed,nz)) ; ALLOC_(CS%frhatv(isd:ied,JsdB:JedB,nz))
   ALLOC_(CS%eta_cor(isd:ied,jsd:jed))
-  if (CS%bound_BT_corr) then
-    ALLOC_(CS%eta_cor_bound(isd:ied,jsd:jed)) ; CS%eta_cor_bound(:,:) = 0.0
-  endif
+  if (CS%bound_BT_corr) &
+    allocate(CS%eta_cor_bound(isd:ied,jsd:jed), source=0.0)
   ALLOC_(CS%IDatu(IsdB:IedB,jsd:jed)) ; ALLOC_(CS%IDatv(isd:ied,JsdB:JedB))
 
   ALLOC_(CS%ua_polarity(isdw:iedw,jsdw:jedw))
@@ -6209,9 +6203,7 @@ subroutine barotropic_end(CS)
   ! Allocated in barotropic_init, called in timestep initialization
   DEALLOC_(CS%ua_polarity) ; DEALLOC_(CS%va_polarity)
   DEALLOC_(CS%IDatu)    ; DEALLOC_(CS%IDatv)
-  if (CS%bound_BT_corr) then
-    DEALLOC_(CS%eta_cor_bound)
-  endif
+  if (allocated(CS%eta_cor_bound)) deallocate(CS%eta_cor_bound)
   DEALLOC_(CS%eta_cor)
   DEALLOC_(CS%bathyT) ; DEALLOC_(CS%IareaT)
   DEALLOC_(CS%frhatu) ; DEALLOC_(CS%frhatv)

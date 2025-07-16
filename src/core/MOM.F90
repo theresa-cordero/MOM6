@@ -103,6 +103,7 @@ use MOM_interface_heights,     only : find_eta, calc_derived_thermo, thickness_t
 use MOM_interface_filter,      only : interface_filter, interface_filter_init, interface_filter_end
 use MOM_interface_filter,      only : interface_filter_CS
 use MOM_internal_tides,        only : int_tide_CS
+use MOM_kappa_shear,           only : kappa_shear_at_vertex
 use MOM_lateral_mixing_coeffs, only : calc_slope_functions, VarMix_init, VarMix_end
 use MOM_lateral_mixing_coeffs, only : calc_resoln_function, calc_depth_function, VarMix_CS
 use MOM_MEKE,                  only : MEKE_alloc_register_restart, step_forward_MEKE
@@ -229,6 +230,7 @@ type, public :: MOM_control_struct ; private
   logical :: rotate_index = .false.   !< True if index map is rotated
   logical :: homogenize_forcings = .false. !< True if all inputs are homogenized
   logical :: update_ustar = .false.   !< True to update ustar from homogenized tau
+  logical :: vertex_shear = .false. !< True if vertex shear is on
 
   type(verticalGrid_type), pointer :: &
     GV => NULL()    !< structure containing vertical grid info
@@ -767,7 +769,10 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
 
   if (therm_reset) then
     CS%time_in_thermo_cycle = 0.0
-    if (associated(CS%tv%frazil))        CS%tv%frazil(:,:)        = 0.0
+    if (associated(CS%tv%frazil)) then
+      CS%tv%frazil(:,:) = 0.0
+      CS%tv%frazil_was_reset = .true.
+    endif
     if (associated(CS%tv%salt_deficit))  CS%tv%salt_deficit(:,:)  = 0.0
     if (associated(CS%tv%TempxPmE))      CS%tv%TempxPmE(:,:)      = 0.0
     if (associated(CS%tv%internal_heat)) CS%tv%internal_heat(:,:) = 0.0
@@ -1964,6 +1969,8 @@ subroutine post_diabatic_halo_updates(CS, G, GV, US, u, v, h, tv)
   call create_group_pass(pass_uv_T_S_h, h, G%Domain, halo=dynamics_stencil)
   call do_group_pass(pass_uv_T_S_h, G%Domain, clock=id_clock_pass)
 
+  if ((.not.tv%frazil_was_reset) .and. CS%vertex_shear) call pass_var(tv%frazil, G%Domain, halo=1)
+
   ! Update derived thermodynamic quantities.
   if (allocated(tv%SpV_avg)) then
     call calc_derived_thermo(tv, h, G, GV, US, halo=dynamics_stencil, debug=CS%debug)
@@ -2327,6 +2334,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   logical :: semi_Boussinesq   ! If true, this run is partially non-Boussinesq
   logical :: use_KPP           ! If true, diabatic is using KPP vertical mixing
   logical :: MLE_use_PBL_MLD   ! If true, use stored boundary layer depths for submesoscale restratification.
+  logical :: OBC_reservoir_init_bug
   integer :: nkml, nkbl, verbosity, write_geom, number_of_OBC_segments
   integer :: dynamics_stencil  ! The computational stencil for the calculations
                                ! in the dynamic core.
@@ -2867,7 +2875,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   call MOM_grid_init(G_in, param_file, US, HI_in, bathymetry_at_vel=bathy_at_vel)
 
   ! Allocate initialize time-invariant MOM variables.
-  call MOM_initialize_fixed(dG_in, US, OBC_in, param_file, .false., dirs%output_directory)
+  call MOM_initialize_fixed(dG_in, US, OBC_in, param_file)
 
   ! Copy the grid metrics and bathymetry to the ocean_grid_type
   call copy_dyngrid_to_MOM_grid(dG_in, G_in, US)
@@ -2984,7 +2992,10 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   endif
 
   if (use_p_surf_in_EOS) allocate(CS%tv%p_surf(isd:ied,jsd:jed), source=0.0)
-  if (use_frazil) allocate(CS%tv%frazil(isd:ied,jsd:jed), source=0.0)
+  if (use_frazil) then
+    allocate(CS%tv%frazil(isd:ied,jsd:jed), source=0.0)
+    CS%tv%frazil_was_reset = .true.
+  endif
   if (bound_salinity) allocate(CS%tv%salt_deficit(isd:ied,jsd:jed), source=0.0)
 
   allocate(CS%Hml(isd:ied,jsd:jed), source=0.0)
@@ -3113,31 +3124,6 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
     ! reservoirs are used.
     call open_boundary_register_restarts(HI, GV, US, CS%OBC, CS%tracer_Reg, &
                           param_file, restart_CSp, use_temperature)
-    ! Is block of code this necessary at all?
-    if (CS%rotate_index .and. associated(OBC_in)) then
-      ! if (mod(turns,2) == 0) then
-        if (CS%OBC%radiation_BCs_exist_globally) then
-          OBC_in%rx_normal => CS%OBC%rx_normal
-          OBC_in%ry_normal => CS%OBC%ry_normal
-        endif
-        if (CS%OBC%oblique_BCs_exist_globally) then
-          OBC_in%rx_oblique_u => CS%OBC%rx_oblique_u
-          OBC_in%ry_oblique_u => CS%OBC%ry_oblique_u
-          OBC_in%rx_oblique_v => CS%OBC%rx_oblique_v
-          OBC_in%ry_oblique_v => CS%OBC%ry_oblique_v
-          OBC_in%cff_normal_u => CS%OBC%cff_normal_u
-          OBC_in%cff_normal_v => CS%OBC%cff_normal_v
-        endif
-        if (associated(CS%OBC%tres_x)) then
-          OBC_in%tres_x => CS%OBC%tres_x
-        endif
-        if (associated(CS%OBC%tres_y)) then
-          OBC_in%tres_y => CS%OBC%tres_y
-        endif
-      ! else
-        ! Do we need to swap around the u- and v-components?
-      ! endif
-    endif
   endif
 
   if (CS%debug_OBCs .and. associated(CS%OBC)) call write_OBC_info(CS%OBC, G, GV, US)
@@ -3166,7 +3152,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
                           local_indexing=.not.global_indexing)
       call create_dyn_horgrid(dG_unmasked_in, HI_in_unmasked, bathymetry_at_vel=bathy_at_vel)
       call clone_MOM_domain(MOM_dom_unmasked, dG_unmasked_in%Domain)
-      call MOM_initialize_fixed(dG_unmasked_in, US, OBC_in, param_file, .false., dirs%output_directory)
+      call MOM_initialize_fixed(dG_unmasked_in, US, OBC_in, param_file)
       call write_ocean_geometry_file(dG_unmasked_in, param_file, dirs%output_directory, US=US, geom_file=geom_file)
       call deallocate_MOM_domain(MOM_dom_unmasked)
       call destroy_dyn_horgrid(dG_unmasked_in)
@@ -3222,6 +3208,16 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
 
       CS%tv%T => T_in
       CS%tv%S => S_in
+
+      if (associated(OBC_in)) then
+        ! Log this parameter in MOM_initialize_state
+        call get_param(param_file, "MOM", "OBC_RESERVOIR_INIT_BUG", OBC_reservoir_init_bug, &
+                   "If true, set the OBC tracer reservoirs at the startup of a new run from the "//&
+                   "interior tracer concentrations regardless of properties that may be explicitly "//&
+                   "specified for the reservoir concentrations.", default=enable_bugs, do_not_log=.true.)
+        if (OBC_reservoir_init_bug .and. (allocated(CS%OBC%tres_x) .or. allocated(CS%OBC%tres_y))) &
+          call MOM_error(FATAL, "OBC_RESERVOIR_INIT_BUG can not be set to true with grid rotation.")
+      endif
     endif
 
     if (use_ice_shelf) then
@@ -3557,14 +3553,14 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
       endif
     endif
   elseif (CS%use_RK2) then
-    call initialize_dyn_unsplit_RK2(CS%u, CS%v, CS%h, Time, G, GV, US,     &
-            param_file, diag, CS%dyn_unsplit_RK2_CSp,                      &
+    call initialize_dyn_unsplit_RK2(CS%u, CS%v, CS%h, CS%tv, Time, G, GV,  &
+            US, param_file, diag, CS%dyn_unsplit_RK2_CSp,                  &
             CS%ADp, CS%CDp, MOM_internal_state, CS%OBC,                    &
             CS%update_OBC_CSp, CS%ALE_CSp, CS%set_visc_CSp, CS%visc, dirs, &
             CS%ntrunc, cont_stencil=CS%cont_stencil)
   else
-    call initialize_dyn_unsplit(CS%u, CS%v, CS%h, Time, G, GV, US,         &
-            param_file, diag, CS%dyn_unsplit_CSp,                          &
+    call initialize_dyn_unsplit(CS%u, CS%v, CS%h, CS%tv, Time, G, GV,      &
+            US, param_file, diag, CS%dyn_unsplit_CSp,                      &
             CS%ADp, CS%CDp, MOM_internal_state, CS%OBC,                    &
             CS%update_OBC_CSp, CS%ALE_CSp, CS%set_visc_CSp, CS%visc, dirs, &
             CS%ntrunc, cont_stencil=CS%cont_stencil)
@@ -3614,6 +3610,8 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
                               CS%ADp, CS%CDp, CS%diabatic_CSp, CS%tracer_flow_CSp, &
                               CS%sponge_CSp, CS%ALE_sponge_CSp, CS%oda_incupd_CSp, CS%int_tide_CSp)
   endif
+
+  CS%vertex_shear = kappa_shear_at_vertex(param_file)
 
   ! GMM, the following is needed to get BLDs into the dynamics module
   if (CS%split .and. fpmix) then
