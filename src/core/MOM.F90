@@ -112,12 +112,12 @@ use MOM_MEKE_types,            only : MEKE_type
 use MOM_mixed_layer_restrat,   only : mixedlayer_restrat, mixedlayer_restrat_init, mixedlayer_restrat_CS
 use MOM_mixed_layer_restrat,   only : mixedlayer_restrat_register_restarts
 use MOM_obsolete_diagnostics,  only : register_obsolete_diagnostics
-use MOM_open_boundary,         only : ocean_OBC_type, OBC_registry_type
+use MOM_open_boundary,         only : ocean_OBC_type, open_boundary_end
 use MOM_open_boundary,         only : register_temp_salt_segments, update_segment_tracer_reservoirs
-use MOM_open_boundary,         only : setup_OBC_tracer_reservoirs, fill_temp_salt_segments
+use MOM_open_boundary,         only : setup_OBC_tracer_reservoirs
 use MOM_open_boundary,         only : open_boundary_register_restarts, remap_OBC_fields
-use MOM_open_boundary,         only : open_boundary_setup_vert, update_OBC_segment_data
-use MOM_open_boundary,         only : rotate_OBC_config, rotate_OBC_init, open_boundary_halo_update
+use MOM_open_boundary,         only : initialize_segment_data, rotate_OBC_config
+use MOM_open_boundary,         only : update_OBC_segment_data, open_boundary_halo_update
 use MOM_open_boundary,         only : write_OBC_info, chksum_OBC_segments
 use MOM_porous_barriers,       only : porous_widths_layer, porous_widths_interface, porous_barriers_init
 use MOM_porous_barriers,       only : porous_barrier_CS
@@ -126,7 +126,7 @@ use MOM_set_visc,              only : set_visc_register_restarts, remap_vertvisc
 use MOM_set_visc,              only : set_visc_init, set_visc_end
 use MOM_shared_initialization, only : write_ocean_geometry_file
 use MOM_sponge,                only : init_sponge_diags, sponge_CS
-use MOM_state_initialization,  only : MOM_initialize_state
+use MOM_state_initialization,  only : MOM_initialize_state, MOM_initialize_OBCs
 use MOM_stoch_eos,             only : MOM_stoch_eos_init, MOM_stoch_eos_run, MOM_stoch_eos_CS
 use MOM_stoch_eos,             only : stoch_EOS_register_restarts, post_stoch_EOS_diags, mom_calc_varT
 use MOM_sum_output,            only : write_energy, accumulate_net_input
@@ -675,6 +675,7 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
   if (do_dyn) then
     n_max = 1
     if (time_interval > CS%dt) n_max = ceiling(time_interval/CS%dt - 0.001)
+    ntstep = 1 ! initialization
     dt = time_interval / real(n_max)
     thermo_does_span_coupling = (CS%thermo_spans_coupling .and. &
                                 (CS%dt_therm > 1.5*cycle_time))
@@ -966,10 +967,9 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
 
       !===========================================================================
       ! This is the start of the tracer advection part of the algorithm.
-      do_advection = .false.
       if (tradv_does_span_coupling .or. .not.do_thermo) then
-        do_advection = (CS%t_dyn_rel_adv + 0.5*dt > dt_tr_adv)
-        if (CS%t_dyn_rel_thermo + 0.5*dt > dt_therm) do_advection = .true.
+        do_advection = ((CS%t_dyn_rel_adv + 0.5*dt > dt_tr_adv) .or. &
+                        (CS%t_dyn_rel_thermo + 0.5*dt > dt_therm))
       else
         do_advection = ((MOD(n,ntastep) == 0) .or. (n==n_max))
       endif
@@ -984,15 +984,12 @@ subroutine step_MOM(forces_in, fluxes_in, sfc_state, Time_start, time_int_in, CS
 
     !===========================================================================
     ! This is the second place where the diabatic processes and remapping could occur.
-    if (do_thermo) then
-      do_diabatic = .false.
-      if (thermo_does_span_coupling .or. .not.do_dyn) then
-        do_diabatic = (CS%t_dyn_rel_thermo + 0.5*dt > dt_therm)
-      else
-        do_diabatic = ((MOD(n,ntstep) == 0) .or. (n==n_max))
-      endif
+    if (thermo_does_span_coupling .or. .not.do_dyn) then
+      do_diabatic = (do_thermo .and. (CS%t_dyn_rel_thermo + 0.5*dt > dt_therm))
+    else
+      do_diabatic = (do_thermo .and. ((MOD(n,ntstep) == 0) .or. (n==n_max)))
     endif
-    if ((CS%t_dyn_rel_adv==0.0) .and. do_thermo .and. (.not.CS%diabatic_first) .and. do_diabatic) then
+    if ((CS%t_dyn_rel_adv==0.0) .and. (.not.CS%diabatic_first) .and. do_diabatic) then
 
       dtdia = CS%t_dyn_rel_thermo
       ! If the MOM6 dynamic and thermodynamic time stepping is being orchestrated
@@ -2894,8 +2891,12 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   endif
   CS%HFrz = (US%Z_to_m * GV%m_to_H) * HFrz_z
 
-  ! Finish OBC configuration that depend on the vertical grid
-  call open_boundary_setup_vert(GV, US, OBC_in)
+  if (associated(OBC_in)) then
+    ! This call allocates the arrays on the segments for open boundary data and initializes the
+    ! relevant vertical remapping structures.   It can only occur after the vertical grid has been
+    ! initialized.
+    call initialize_segment_data(G_in, GV, US, OBC_in, param_file)
+  endif
 
   !   Shift from using the temporary dynamic grid type to using the final (potentially static)
   ! and properly rotated ocean-specific grid type and horizontal index type.
@@ -3094,20 +3095,6 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   call mixedlayer_restrat_register_restarts(HI, GV, US, param_file, &
            CS%mixedlayer_restrat_CSp, restart_CSp)
 
-  if (CS%rotate_index .and. associated(OBC_in) .and. use_temperature) then
-    ! NOTE: register_temp_salt_segments includes allocation of tracer fields
-    !   along segments.  Bit reproducibility requires that MOM_initialize_state
-    !   be called on the input index map, so we must setup both OBC and OBC_in.
-    !
-    ! XXX: This call on OBC_in allocates the tracer fields on the unrotated
-    !   grid, but also incorrectly stores a pointer to a tracer_type for the
-    !   rotated registry (e.g. segment%tr_reg%Tr(n)%Tr) from CS%tracer_reg.
-    !
-    !   While incorrect and potentially dangerous, it does not seem that this
-    !   pointer is used during initialization, so we leave it for now.
-    call register_temp_salt_segments(GV, US, OBC_in, CS%tracer_Reg, param_file)
-  endif
-
   if (associated(CS%OBC)) then
     ! Set up remaining information about open boundary conditions that is needed for OBCs.
     ! Package specific changes to OBCs occur here.
@@ -3124,9 +3111,10 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
     ! reservoirs are used.
     call open_boundary_register_restarts(HI, GV, US, CS%OBC, CS%tracer_Reg, &
                           param_file, restart_CSp, use_temperature)
+
+    if (CS%debug_OBCs) call write_OBC_info(CS%OBC, G, GV, US)
   endif
 
-  if (CS%debug_OBCs .and. associated(CS%OBC)) call write_OBC_info(CS%OBC, G, GV, US)
 
   if (present(waves_CSp)) then
     call waves_register_restarts(waves_CSp, HI, GV, US, param_file, restart_CSp)
@@ -3270,18 +3258,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
       call update_ALE_sponge_field(CS%ALE_sponge_CSp, S_in, G, GV, CS%S)
     endif
 
-    if (associated(OBC_in)) then
-      if (use_temperature) then
-        call pass_var(CS%tv%T, G%Domain)
-        call pass_var(CS%tv%S, G%Domain)
-        call fill_temp_salt_segments(G, GV, US, CS%OBC, CS%tv)
-      endif
-
-      call rotate_OBC_init(OBC_in, G, CS%OBC)
-      call calc_derived_thermo(CS%tv, CS%h, G, GV, US)
-      call update_OBC_segment_data(G, GV, US, CS%OBC, CS%tv, CS%h, Time)
-    endif
-
+   ! Deallocate the unrotated arrays and types that are no longer needed.
     deallocate(u_in)
     deallocate(v_in)
     deallocate(h_in)
@@ -3289,8 +3266,9 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
       deallocate(T_in)
       deallocate(S_in)
     endif
-    if (use_ice_shelf) &
-      deallocate(frac_shelf_in,mass_shelf_in)
+    if (use_ice_shelf) deallocate(frac_shelf_in, mass_shelf_in)
+    if (associated(OBC_in)) call open_boundary_end(OBC_in)
+
   else  ! The model is being run without grid rotation.  This is true of all production runs.
     if (use_ice_shelf) then
       call initialize_ice_shelf(param_file, G, Time, ice_shelf_CSp, diag_ptr, Time_init, &
@@ -3320,6 +3298,19 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
   if (.not.(GV%Boussinesq .or. GV%semi_Boussinesq)) then
     allocate(CS%tv%SpV_avg(isd:ied,jsd:jed,nz), source=0.0)
     CS%tv%valid_SpV_halo = -1  ! This array does not yet have any valid data.
+  endif
+
+  if (associated(CS%OBC)) then
+    call MOM_initialize_OBCs(CS%h, CS%tv, CS%OBC, Time, G, GV, US, param_file, restart_CSp, CS%tracer_Reg)
+
+    if (use_temperature) then
+      call pass_var(CS%tv%T, G%Domain, complete=.false.)
+      call pass_var(CS%tv%S, G%Domain, complete=.true.)
+    endif
+    call calc_derived_thermo(CS%tv, CS%h, G, GV, US)
+
+    ! Call this during initialization to fill boundary arrays from fixed values
+    call update_OBC_segment_data(G, GV, US, CS%OBC, CS%tv, CS%h, Time)
   endif
 
   if (use_ice_shelf .and. CS%debug) then
@@ -4551,6 +4542,7 @@ subroutine MOM_end(CS)
   DEALLOC_(CS%uh) ; DEALLOC_(CS%vh)
 
   if (associated(CS%update_OBC_CSp)) call OBC_register_end(CS%update_OBC_CSp)
+  if (associated(CS%OBC)) call open_boundary_end(CS%OBC)
 
   call verticalGridEnd(CS%GV)
   call MOM_grid_end(CS%G)
