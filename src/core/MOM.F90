@@ -3114,6 +3114,11 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
     call register_temp_salt_segments(GV, US, OBC_in, CS%tracer_Reg, param_file)
   endif
 
+  ! move to just before call_tracer_register_obc_segments 
+  if (associated(OBC_in)) then
+    ! TJC
+    call initialize_segment_data(G_in, GV, US, OBC_in, param_file)
+  endif
   if (associated(CS%OBC)) then
     ! Set up remaining information about open boundary conditions that is needed for OBCs.
     ! Package specific changes to OBCs occur here.
@@ -3250,12 +3255,12 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
           sponge_in_CSp, ALE_sponge_in_CSp, oda_incupd_in_CSp, OBC_in, Time_in)
     endif
 
-    ! move to just before MOM_initialize_OBCs (this call was in that routine) 
-    ! Finish OBC configuration that depend on the vertical grid
-    if (associated(OBC_in)) then
-      ! TJC -- with initalize here
-      call initialize_segment_data(G_in, GV, US, OBC_in, param_file)
-    endif
+    !! move to just before MOM_initialize_OBCs (this call was in that routine) 
+    !! Finish OBC configuration that depend on the vertical grid
+    !if (associated(OBC_in)) then
+    !  ! TJC -- with initalize here
+    !  call initialize_segment_data(G_in, GV, US, OBC_in, param_file)
+    !endif
     if (associated(OBC_in)) then ! TJC -- minor change
       call MOM_initialize_OBCs(h_in, CS%tv, OBC_in, Time, G_in, GV, US, param_file, restart_CSp, CS%tracer_Reg)
     endif
@@ -3324,12 +3329,12 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
           CS%sponge_CSp, CS%ALE_sponge_CSp, CS%oda_incupd_CSp, CS%OBC, Time_in)
     endif
 
-    ! move to just before MOM_initialize_OBCs (this call was in that routine) 
-    ! Finish OBC configuration that depend on the vertical grid
-    if (associated(OBC_in)) then
-      ! TJC -- with initalize here
-      call initialize_segment_data(G, GV, US, CS%OBC, param_file)
-    endif
+    !! move to just before MOM_initialize_OBCs (this call was in that routine) 
+    !! Finish OBC configuration that depend on the vertical grid
+    !if (associated(OBC_in)) then
+    !  ! TJC -- with initalize here
+    !  call initialize_segment_data(G, GV, US, CS%OBC, param_file)
+    !endif
     if (associated(CS%OBC)) then ! TJC -- minor change 
       call MOM_initialize_OBCs(CS%h, CS%tv, CS%OBC, Time, G, GV, US, param_file, restart_CSp, CS%tracer_Reg)
     endif
