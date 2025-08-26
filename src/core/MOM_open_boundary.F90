@@ -47,7 +47,6 @@ public open_boundary_end
 public open_boundary_impose_normal_slope
 public open_boundary_impose_land_mask
 public radiation_open_bdry_conds
-public set_tracer_data
 public update_OBC_segment_data
 public open_boundary_test_extern_uv
 public open_boundary_test_extern_h
@@ -3684,58 +3683,6 @@ subroutine gradient_at_q_points(G, GV, segment, uvel, vvel)
 end subroutine gradient_at_q_points
 
 
-!> Sets the initial values of the tracer open boundary conditions.
-!! Redoing this elsewhere.
-subroutine set_tracer_data(OBC, tv, h, G, GV, PF)
-  type(ocean_grid_type),                     intent(inout) :: G   !< Ocean grid structure
-  type(verticalGrid_type),                   intent(in)    :: GV  !< The ocean's vertical grid structure
-  type(ocean_OBC_type),              target, intent(in)    :: OBC !< Open boundary structure
-  type(thermo_var_ptrs),                     intent(inout) :: tv  !< Thermodynamics structure
-  real, dimension(SZI_(G),SZJ_(G),SZK_(GV)), intent(inout) :: h   !< Layer thicknesses [H ~> m or kg m-2]
-  type(param_file_type),                     intent(in)    :: PF  !< Parameter file handle
-
-  type(OBC_segment_type), pointer :: segment  => NULL() ! pointer to segment type list
-  integer :: i, j, k, n
-
-  ! For now, there are no radiation conditions applied to the thicknesses, since
-  ! the thicknesses might not be physically motivated.  Instead, sponges should be
-  ! used to enforce the near-boundary layer structure.
-
-  if (associated(tv%T)) then
-
-    call pass_var(tv%T, G%Domain)
-    call pass_var(tv%S, G%Domain)
-
-    do n=1,OBC%number_of_segments
-      segment => OBC%segment(n)
-      if (.not. segment%on_pe) cycle
-
-      if (segment%direction == OBC_DIRECTION_E) then
-        I=segment%HI%IsdB
-        do k=1,GV%ke ;  do j=segment%HI%jsd,segment%HI%jed
-          tv%T(i+1,j,k) = tv%T(i,j,k) ; tv%S(i+1,j,k) = tv%S(i,j,k)
-        enddo ; enddo
-      elseif (segment%direction == OBC_DIRECTION_W) then
-        I=segment%HI%IsdB
-        do k=1,GV%ke ;  do j=segment%HI%jsd,segment%HI%jed
-          tv%T(i,j,k) = tv%T(i+1,j,k) ; tv%S(i,j,k) = tv%S(i+1,j,k)
-        enddo ; enddo
-      elseif (segment%direction == OBC_DIRECTION_N) then
-        J=segment%HI%JsdB
-        do k=1,GV%ke ;  do i=segment%HI%isd,segment%HI%ied
-          tv%T(i,j+1,k) = tv%T(i,j,k) ; tv%S(i,j+1,k) = tv%S(i,j,k)
-        enddo ; enddo
-      elseif (segment%direction == OBC_DIRECTION_S) then
-        J=segment%HI%JsdB
-        do k=1,GV%ke ;  do i=segment%HI%isd,segment%HI%ied
-          tv%T(i,j,k) = tv%T(i,j+1,k) ; tv%S(i,j,k) = tv%S(i,j+1,k)
-        enddo ; enddo
-      endif
-    enddo
-  endif
-
-end subroutine set_tracer_data
-
 !> Return the field number on the segment for the named field, or -1 if there is no field with that name.
 function lookup_seg_field(OBC_seg, field)
   type(OBC_segment_type), intent(in) :: OBC_seg !< OBC segment
@@ -5943,7 +5890,6 @@ subroutine rotate_OBC_config(OBC_in, G_in, OBC, G, turns)
     call rotate_OBC_segment_config(OBC_in%segment(l_seg), G_in, OBC%segment(l_seg), G, turns)
     ! Data up to setup_[uv]_point_obc is needed for allocate_obc_segment_data!
     call allocate_OBC_segment_data(OBC, OBC%segment(l_seg))
-    call rotate_OBC_segment_data(OBC_in%segment(l_seg), OBC%segment(l_seg), turns)
   enddo
 
   ! The horizontal segment map
@@ -6285,6 +6231,7 @@ subroutine rotate_OBC_segment_data(segment_in, segment, turns)
   integer, intent(in) :: turns  !< The number of quarter turns of the grid to apply
 
   ! Local variables
+  logical :: flip_normal_vel_sign, flip_tang_vel_sign
   integer :: n
   integer :: num_fields
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB, ke
@@ -6466,39 +6413,41 @@ subroutine rotate_OBC_segment_data(segment_in, segment, turns)
     enddo
   endif
 
+  ! Change the sign of the normal or tangential velocities or transports that have been read in from
+  ! a file, depending on the orientation of the face and the number of quarter turns of the grid.
+  flip_normal_vel_sign = .false. ; flip_tang_vel_sign = .false.
   do n = 1, num_fields
-    if ((segment%field(n)%name == 'U' .or. segment%field(n)%name == 'Uamp') .and. &
-         (modulo(turns, 4) == 1 .or. modulo(turns, 4) == 2)) then
-      segment%field(n)%buffer_dst(:,:,:) = -segment%field(n)%buffer_dst(:,:,:)
-      if (segment%is_E_or_W) then
-        segment%normal_trans(:,:,:) = -segment%normal_trans(:,:,:)
-        segment%normal_vel(:,:,:) = -segment%normal_vel(:,:,:)
-        segment%normal_vel_bt(:,:) = -segment%normal_vel_bt(:,:)
-        if (allocated(segment%nudged_normal_vel)) &
-            segment%nudged_normal_vel(:,:,:) = -segment%nudged_normal_vel(:,:,:)
-      else
-        if (allocated(segment%tangential_vel)) &
-            segment%tangential_vel(:,:,:) = -segment%tangential_vel(:,:,:)
-        if (allocated(segment%nudged_tangential_vel)) &
-            segment%nudged_tangential_vel(:,:,:) = -segment%nudged_tangential_vel(:,:,:)
-      endif
-    elseif ((segment%field(n)%name == 'V' .or. segment%field(n)%name == 'Vamp') .and. &
-         (modulo(turns, 4) == 3 .or. modulo(turns, 4) == 2)) then
-      segment%field(n)%buffer_dst(:,:,:) = -segment%field(n)%buffer_dst(:,:,:)
-      if (segment%is_N_or_S) then
-        segment%normal_trans(:,:,:) = -segment%normal_trans(:,:,:)
-        segment%normal_vel(:,:,:) = -segment%normal_vel(:,:,:)
-        segment%normal_vel_bt(:,:) = -segment%normal_vel_bt(:,:)
-        if (allocated(segment%nudged_normal_vel)) &
-            segment%nudged_normal_vel(:,:,:) = -segment%nudged_normal_vel(:,:,:)
-      else
-        if (allocated(segment%tangential_vel)) &
-            segment%tangential_vel(:,:,:) = -segment%tangential_vel(:,:,:)
-        if (allocated(segment%nudged_tangential_vel)) &
-            segment%nudged_tangential_vel(:,:,:) = -segment%nudged_tangential_vel(:,:,:)
-      endif
+    if (((segment%field(n)%name == 'U') .or. (segment%field(n)%name == 'Uamp')) .and. &
+        ((modulo(turns, 4) == 1) .or. (modulo(turns, 4) == 2)) ) then
+      if (allocated(segment%field(n)%buffer_dst)) &
+        segment%field(n)%buffer_dst(:,:,:) = -segment%field(n)%buffer_dst(:,:,:)
+      segment%field(n)%value = -segment%field(n)%value
+      if (segment%is_E_or_W) flip_normal_vel_sign = .true.
+      if (segment%is_N_or_S) flip_tang_vel_sign = .true.
+    elseif (((segment%field(n)%name == 'V') .or. (segment%field(n)%name == 'Vamp')) .and. &
+            ((modulo(turns, 4) == 3) .or. (modulo(turns, 4) == 2)) ) then
+      if (allocated(segment%field(n)%buffer_dst)) &
+        segment%field(n)%buffer_dst(:,:,:) = -segment%field(n)%buffer_dst(:,:,:)
+      segment%field(n)%value = -segment%field(n)%value
+      if (segment%is_N_or_S) flip_normal_vel_sign = .true.
+      if (segment%is_E_or_W) flip_tang_vel_sign = .true.
     endif
   enddo
+
+  if (flip_normal_vel_sign) then
+    segment%normal_trans(:,:,:) = -segment%normal_trans(:,:,:)
+    segment%normal_vel(:,:,:) = -segment%normal_vel(:,:,:)
+    segment%normal_vel_bt(:,:) = -segment%normal_vel_bt(:,:)
+    if (allocated(segment%nudged_normal_vel)) &
+      segment%nudged_normal_vel(:,:,:) = -segment%nudged_normal_vel(:,:,:)
+  endif
+
+  if (flip_tang_vel_sign) then
+    if (allocated(segment%tangential_vel)) &
+      segment%tangential_vel(:,:,:) = -segment%tangential_vel(:,:,:)
+    if (allocated(segment%nudged_tangential_vel)) &
+      segment%nudged_tangential_vel(:,:,:) = -segment%nudged_tangential_vel(:,:,:)
+  endif
 
   segment%temp_segment_data_exists = segment_in%temp_segment_data_exists
   segment%salt_segment_data_exists = segment_in%salt_segment_data_exists
