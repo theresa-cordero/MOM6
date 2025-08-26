@@ -3114,11 +3114,11 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
     call register_temp_salt_segments(GV, US, OBC_in, CS%tracer_Reg, param_file)
   endif
 
-  ! move to just before call_tracer_register_obc_segments 
-  if (associated(OBC_in)) then
-    ! TJC
-    call initialize_segment_data(G_in, GV, US, OBC_in, param_file)
-  endif
+  !! move to just before call_tracer_register_obc_segments 
+  !if (associated(OBC_in)) then
+  !  ! TJC
+  !  call initialize_segment_data(G_in, GV, US, OBC_in, param_file)
+  !endif
   if (associated(CS%OBC)) then
     ! Set up remaining information about open boundary conditions that is needed for OBCs.
     ! Package specific changes to OBCs occur here.
@@ -3135,6 +3135,11 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
     ! reservoirs are used.
     call open_boundary_register_restarts(HI, GV, US, CS%OBC, CS%tracer_Reg, &
                           param_file, restart_CSp, use_temperature)
+  endif
+  ! move to just after call_tracer_register_obc_segments 
+  if (associated(OBC_in)) then
+    ! TJC
+    call initialize_segment_data(G_in, GV, US, OBC_in, param_file)
   endif
 
   if (CS%debug_OBCs .and. associated(CS%OBC)) call write_OBC_info(CS%OBC, G, GV, US)
