@@ -46,7 +46,7 @@ use MOM_boundary_update,       only : update_OBC_data, update_OBC_CS
 use MOM_continuity,            only : continuity, continuity_CS
 use MOM_continuity,            only : continuity_init, continuity_stencil
 use MOM_CoriolisAdv,           only : CorAdCalc, CoriolisAdv_CS
-use MOM_CoriolisAdv,           only : CoriolisAdv_init, CoriolisAdv_end
+use MOM_CoriolisAdv,           only : CoriolisAdv_init, CoriolisAdv_end, CoriolisAdv_stencil
 use MOM_debugging,             only : check_redundant
 use MOM_grid,                  only : ocean_grid_type
 use MOM_harmonic_analysis,     only : harmonic_analysis_CS
@@ -402,6 +402,7 @@ subroutine step_MOM_dyn_split_RK2b(u_av, v_av, h, tv, visc, Time_local, dt, forc
 
   integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz
   integer :: cont_stencil, obc_stencil
+  integer :: cor_stencil
 
   is  = G%isc  ; ie  = G%iec  ; js  = G%jsc  ; je  = G%jec ; nz = GV%ke
   Isq = G%IscB ; Ieq = G%IecB ; Jsq = G%JscB ; Jeq = G%JecB
@@ -466,6 +467,7 @@ subroutine step_MOM_dyn_split_RK2b(u_av, v_av, h, tv, visc, Time_local, dt, forc
 
   cont_stencil = continuity_stencil(CS%continuity_CSp)
   obc_stencil = 2
+  cor_stencil = CoriolisAdv_stencil(CS%CoriolisAdv)
   if (associated(CS%OBC)) then
     if (CS%OBC%oblique_BCs_exist_globally) obc_stencil = 3
   endif
@@ -476,16 +478,20 @@ subroutine step_MOM_dyn_split_RK2b(u_av, v_av, h, tv, visc, Time_local, dt, forc
   call create_group_pass(CS%pass_uvp, up, vp, G%Domain, halo=max(1,cont_stencil))
   call create_group_pass(CS%pass_uv_inst, u_inst, v_inst, G%Domain, halo=max(2,cont_stencil))
 
-  call create_group_pass(CS%pass_hp_uv, hp, G%Domain, halo=2)
-  call create_group_pass(CS%pass_hp_uv, u_av, v_av, G%Domain, halo=max(2,obc_stencil))
-  call create_group_pass(CS%pass_hp_uv, uh(:,:,:), vh(:,:,:), G%Domain, halo=max(2,obc_stencil))
+  call create_group_pass(CS%pass_hp_uv, hp, G%Domain, halo=cor_stencil)
+  call create_group_pass(CS%pass_hp_uv, u_av, v_av, G%Domain, halo=max(cor_stencil,obc_stencil))
+  call create_group_pass(CS%pass_hp_uv, uh(:,:,:), vh(:,:,:), G%Domain, halo=max(cor_stencil,obc_stencil))
 
-  call create_group_pass(CS%pass_hp_uhvh, hp, G%Domain, halo=2)
-  call create_group_pass(CS%pass_hp_uhvh, uh(:,:,:), vh(:,:,:), G%Domain, halo=max(2,obc_stencil))
+  call create_group_pass(CS%pass_hp_uhvh, hp, G%Domain, halo=cor_stencil)
+  call create_group_pass(CS%pass_hp_uhvh, uh(:,:,:), vh(:,:,:), G%Domain, halo=max(cor_stencil,obc_stencil))
+  if (cor_stencil > 2) then
+    call create_group_pass(CS%pass_hp_uhvh, u_av, v_av, G%Domain, halo=max(cor_stencil,obc_stencil))
+    call create_group_pass(CS%pass_hp_uhvh, h, G%Domain, halo=cor_stencil)
+  endif
 
-  call create_group_pass(CS%pass_h_uv, h, G%Domain, halo=max(2,cont_stencil))
-  call create_group_pass(CS%pass_h_uv, u_av, v_av, G%Domain, halo=max(2,obc_stencil))
-  call create_group_pass(CS%pass_h_uv, uh(:,:,:), vh(:,:,:), G%Domain, halo=max(2,obc_stencil))
+  call create_group_pass(CS%pass_h_uv, h, G%Domain, halo=max(cor_stencil,cont_stencil))
+  call create_group_pass(CS%pass_h_uv, u_av, v_av, G%Domain, halo=max(cor_stencil,obc_stencil))
+  call create_group_pass(CS%pass_h_uv, uh(:,:,:), vh(:,:,:), G%Domain, halo=max(cor_stencil,obc_stencil))
 
   call cpu_clock_end(id_clock_pass)
   !--- end set up for group halo pass
@@ -548,7 +554,7 @@ subroutine step_MOM_dyn_split_RK2b(u_av, v_av, h, tv, visc, Time_local, dt, forc
   endif
 
   !$OMP parallel do default(shared)
-  do k=1,nz ; do j=js-2,je+2 ; do i=is-2,ie+2
+  do k=1,nz ; do j=js-cor_stencil,je+cor_stencil ; do i=is-cor_stencil,ie+cor_stencil
     h_av(i,j,k) = 0.5*(h(i,j,k) + hp(i,j,k))
   enddo ; enddo ; enddo
 
@@ -803,7 +809,7 @@ subroutine step_MOM_dyn_split_RK2b(u_av, v_av, h, tv, visc, Time_local, dt, forc
 
   ! h_av = (h + hp)/2
   !$OMP parallel do default(shared)
-  do k=1,nz ; do j=js-2,je+2 ; do i=is-2,ie+2
+  do k=1,nz ; do j=js-cor_stencil,je+cor_stencil ; do i=is-cor_stencil,ie+cor_stencil
     h_av(i,j,k) = 0.5*(h(i,j,k) + hp(i,j,k))
   enddo ; enddo ; enddo
 
@@ -1253,7 +1259,7 @@ subroutine initialize_dyn_split_RK2b(u, v, h, tv, uh, vh, eta, Time, G, GV, US, 
                       diag, CS, HA_CSp, restart_CS, dt, Accel_diag, Cont_diag, MIS, &
                       VarMix, MEKE, thickness_diffuse_CSp,                  &
                       OBC, update_OBC_CSp, ALE_CSp, set_visc, &
-                      visc, dirs, ntrunc, pbv, calc_dtbt, cont_stencil)
+                      visc, dirs, ntrunc, pbv, calc_dtbt, cont_stencil, dyn_h_stencil)
   type(ocean_grid_type),            intent(inout) :: G          !< ocean grid structure
   type(verticalGrid_type),          intent(in)    :: GV         !< ocean vertical grid structure
   type(unit_scale_type),            intent(in)    :: US         !< A dimensional unit scaling type
@@ -1299,6 +1305,9 @@ subroutine initialize_dyn_split_RK2b(u, v, h, tv, uh, vh, eta, Time, G, GV, US, 
   type(porous_barrier_type),        intent(in)    :: pbv        !< porous barrier fractional cell metrics
   integer,                          intent(out)   :: cont_stencil !< The stencil for thickness
                                                                 !! from the continuity solver.
+  integer,                          intent(out)   :: dyn_h_stencil !< The stencil for thickness for the
+                                                                !! dynamics based on the continuity
+                                                                !! solver and Coriolis scheme.
 
   ! local variables
   real, dimension(SZI_(G),SZJ_(G),SZK_(GV)) :: h_tmp ! A temporary copy of the layer thicknesses [H ~> m or kg m-2]
@@ -1384,7 +1393,7 @@ subroutine initialize_dyn_split_RK2b(u, v, h, tv, uh, vh, eta, Time, G, GV, US, 
                  "If true, visc_rem_[uv] in split mode is incorrectly calculated or accounted "//&
                  "for in two places. This parameter controls the defaults of two individual "//&
                  "flags, VISC_REM_TIMESTEP_BUG in MOM_dynamics_split_RK2(b) and "//&
-                 "VISC_REM_BT_WEIGHT_BUG in MOM_barotropic.", default=enable_bugs)
+                 "VISC_REM_BT_WEIGHT_BUG in MOM_barotropic.", default=.false.)
   call get_param(param_file, mdl, "VISC_REM_TIMESTEP_BUG", CS%visc_rem_dt_bug, &
                  "If true, recover a bug that uses dt_pred rather than dt in "//&
                  "vertvisc_remnant() at the end of predictor stage for the following "//&
@@ -1445,6 +1454,7 @@ subroutine initialize_dyn_split_RK2b(u, v, h, tv, uh, vh, eta, Time, G, GV, US, 
   call continuity_init(Time, G, GV, US, param_file, diag, CS%continuity_CSp)
   cont_stencil = continuity_stencil(CS%continuity_CSp)
   call CoriolisAdv_init(Time, G, GV, US, param_file, diag, CS%ADp, CS%CoriolisAdv)
+  dyn_h_stencil = max(cont_stencil, CoriolisAdv_stencil(CS%CoriolisAdv))
   if (CS%calculate_SAL) call SAL_init(h, tv, G, GV, US, param_file, CS%SAL_CSp, restart_CS)
   if (CS%use_tides) then
     call tidal_forcing_init(Time, G, US, param_file, CS%tides_CSp, CS%HA_CSp)
