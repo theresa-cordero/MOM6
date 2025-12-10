@@ -50,7 +50,7 @@ use MOM_CVMix_KPP,             only : KPP_get_BLD, KPP_CS
 use MOM_debugging,             only : check_redundant
 use MOM_energetic_PBL,         only : energetic_PBL_get_MLD, energetic_PBL_CS
 use MOM_grid,                  only : ocean_grid_type
-use MOM_harmonic_analysis,     only : harmonic_analysis_CS
+use MOM_harmonic_analysis,     only : HA_init, harmonic_analysis_CS
 use MOM_hor_index,             only : hor_index_type
 use MOM_hor_visc,              only : horizontal_viscosity, hor_visc_CS, hor_visc_vel_stencil
 use MOM_hor_visc,              only : hor_visc_init, hor_visc_end
@@ -60,6 +60,8 @@ use MOM_MEKE_types,            only : MEKE_type
 use MOM_open_boundary,         only : ocean_OBC_type, radiation_open_bdry_conds
 use MOM_open_boundary,         only : open_boundary_zero_normal_flow, open_boundary_query
 use MOM_open_boundary,         only : open_boundary_test_extern_h, update_OBC_ramp
+use MOM_open_boundary,         only : copy_thickness_reservoirs
+use MOM_open_boundary,         only : update_segment_thickness_reservoirs
 use MOM_PressureForce,         only : PressureForce, PressureForce_CS
 use MOM_PressureForce,         only : PressureForce_init
 use MOM_set_visc,              only : set_viscous_ML, set_visc_CS
@@ -172,6 +174,7 @@ type, public :: MOM_dyn_split_RK2_CS ; private
                                   !! of restart files.
   logical :: calculate_SAL        !< If true, calculate self-attraction and loading.
   logical :: use_tides            !< If true, tidal forcing is enabled.
+  logical :: use_HA               !< If true, perform inline harmonic analysis.
   logical :: remap_aux            !< If true, apply ALE remapping to all of the auxiliary 3-D
                                   !! variables that are needed to reproduce across restarts,
                                   !! similarly to what is done with the primary state variables.
@@ -646,6 +649,9 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   if (G%nonblocking_updates) &
     call complete_group_pass(CS%pass_visc_rem, G%Domain, clock=id_clock_pass)
 
+  if (associated(CS%OBC)) &
+    call copy_thickness_reservoirs(CS%OBC, G, GV)
+
 ! u_accel_bt = layer accelerations due to barotropic solver
   if (associated(CS%BT_cont) .or. CS%BT_use_layer_fluxes) then
     call cpu_clock_begin(id_clock_continuity)
@@ -701,13 +707,13 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   call cpu_clock_end(id_clock_mom_update)
 
   if (CS%debug) then
+    call MOM_accel_chksum("Predictor accel", CS%CAu_pred, CS%CAv_pred, CS%PFu, CS%PFv, &
+             CS%diffu, CS%diffv, G, GV, US, CS%pbce, CS%u_accel_bt, CS%v_accel_bt, symmetric=sym)
     call uvchksum("Predictor 1 [uv]", up, vp, G%HI, haloshift=0, symmetric=sym, unscale=US%L_T_to_m_s)
     call hchksum(h, "Predictor 1 h", G%HI, haloshift=1, unscale=GV%H_to_MKS)
     call uvchksum("Predictor 1 [uv]h", uh, vh, G%HI,haloshift=2, &
                   symmetric=sym, unscale=GV%H_to_MKS*US%L_to_m**2*US%s_to_T)
-!   call MOM_state_chksum("Predictor 1", up, vp, h, uh, vh, G, GV, US, haloshift=1)
-    call MOM_accel_chksum("Predictor accel", CS%CAu_pred, CS%CAv_pred, CS%PFu, CS%PFv, &
-             CS%diffu, CS%diffv, G, GV, US, CS%pbce, CS%u_accel_bt, CS%v_accel_bt, symmetric=sym)
+    ! call MOM_state_chksum("Predictor 1", up, vp, h, uh, vh, G, GV, US, haloshift=1)
     call MOM_state_chksum("Predictor 1 init", u_inst, v_inst, h, uh, vh, G, GV, US, haloshift=1, &
                           symmetric=sym)
     if (debug_redundant) then
@@ -970,14 +976,15 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
   call cpu_clock_end(id_clock_mom_update)
 
   if (CS%debug) then
+    call MOM_accel_chksum("Corrector accel", CS%CAu, CS%CAv, CS%PFu, CS%PFv, &
+                          CS%diffu, CS%diffv, G, GV, US, CS%pbce, CS%u_accel_bt, CS%v_accel_bt, &
+                          symmetric=sym)
     call uvchksum("Corrector 1 [uv]", u_inst, v_inst, G%HI, haloshift=0, symmetric=sym, unscale=US%L_T_to_m_s)
     call hchksum(h, "Corrector 1 h", G%HI, haloshift=1, unscale=GV%H_to_MKS)
     call uvchksum("Corrector 1 [uv]h", uh, vh, G%HI, haloshift=2, &
                   symmetric=sym, unscale=GV%H_to_MKS*US%L_to_m**2*US%s_to_T)
-  ! call MOM_state_chksum("Corrector 1", u_inst, v_inst, h, uh, vh, G, GV, US, haloshift=1)
-    call MOM_accel_chksum("Corrector accel", CS%CAu, CS%CAv, CS%PFu, CS%PFv, &
-                          CS%diffu, CS%diffv, G, GV, US, CS%pbce, CS%u_accel_bt, CS%v_accel_bt, &
-                          symmetric=sym)
+    ! call MOM_state_chksum("Corrector 1", u_inst, v_inst, h, uh, vh, G, GV, US, haloshift=1)
+
   endif
 
   ! u <- u + dt d/dz visc d/dz u
@@ -1082,6 +1089,10 @@ subroutine step_MOM_dyn_split_RK2(u_inst, v_inst, h, tv, visc, Time_local, dt, f
       vhtr(i,J,k) = vhtr(i,J,k) + vh(i,J,k)*dt
     enddo ; enddo
   enddo
+
+  if (associated(CS%OBC)) then
+    call update_segment_thickness_reservoirs(G, GV, uhtr, vhtr, h, CS%OBC)
+  endif
 
   if (CS%store_CAu) then
     ! Calculate a predictor-step estimate of the Coriolis and momentum advection terms
@@ -1415,6 +1426,7 @@ subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, p
 
   integer :: i, j, k, is, ie, js, je, isd, ied, jsd, jed, nz
   integer :: IsdB, IedB, JsdB, JedB
+  integer :: nc           ! Number of tidal constituents to be harmonically analyzed
   is   = G%isc  ; ie   = G%iec  ; js   = G%jsc  ; je   = G%jec ; nz = GV%ke
   isd  = G%isd  ; ied  = G%ied  ; jsd  = G%jsd  ; jed  = G%jed
   IsdB = G%IsdB ; IedB = G%IedB ; JsdB = G%JsdB ; JedB = G%JedB
@@ -1435,6 +1447,12 @@ subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, p
                  "If true, apply tidal momentum forcing.", default=.false.)
   call get_param(param_file, mdl, "CALCULATE_SAL", CS%calculate_SAL, &
                  "If true, calculate self-attraction and loading.", default=CS%use_tides)
+  call get_param(param_file, mdl, "USE_HA", CS%use_HA, &
+                 "If true, perform inline harmonic analysis.", default=.false.)
+  call get_param(param_file, mdl, "HA_N_CONST", nc, &
+                 "Number of tidal constituents to be harmonically analyzed.", &
+                 default=0, do_not_log=.not.CS%use_HA)
+  if (nc<=0) CS%use_HA = .false.
   call get_param(param_file, mdl, "BE", CS%be, &
                  "If SPLIT is true, BE determines the relative weighting "//&
                  "of a  2nd-order Runga-Kutta baroclinic time stepping "//&
@@ -1560,14 +1578,15 @@ subroutine initialize_dyn_split_RK2(u, v, h, tv, uh, vh, eta, Time, G, GV, US, p
 
   id_clock_pass_init = cpu_clock_id('(Ocean init message passing)', grain=CLOCK_ROUTINE)
 
-  call continuity_init(Time, G, GV, US, param_file, diag, CS%continuity_CSp)
+  call continuity_init(Time, G, GV, US, param_file, diag, CS%continuity_CSp, CS%OBC)
   cont_stencil = continuity_stencil(CS%continuity_CSp)
   call CoriolisAdv_init(Time, G, GV, US, param_file, diag, CS%ADp, CS%CoriolisAdv)
   cor_stencil = CoriolisAdv_stencil(CS%CoriolisAdv)
   dyn_h_stencil = max(cont_stencil, CoriolisAdv_stencil(CS%CoriolisAdv))
   if (CS%calculate_SAL) call SAL_init(h, tv, G, GV, US, param_file, CS%SAL_CSp, restart_CS)
-  if (CS%use_tides) then
-    call tidal_forcing_init(Time, G, US, param_file, CS%tides_CSp, CS%HA_CSp)
+  if (CS%use_tides) call tidal_forcing_init(Time, G, US, param_file, CS%tides_CSp)
+  if (CS%use_HA) then
+    call HA_init(Time, US, param_file, nc, CS%HA_CSp)
     HA_CSp => CS%HA_CSp
   else
     HA_CSp => NULL()

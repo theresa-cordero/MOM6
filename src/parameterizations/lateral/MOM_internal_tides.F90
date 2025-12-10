@@ -48,7 +48,7 @@ type, public :: int_tide_CS ; private
   integer :: nMode = 1       !< The number of internal tide vertical modes
   integer :: nAngle = 24     !< The number of internal tide angular orientations
   integer :: energized_angle = -1 !< If positive, only this angular band is energized for debugging purposes
-  real    :: dt_itides       !< The timestep for internal tides ray-tracing [s ~> T]
+  real    :: dt_itides       !< The timestep for internal tides ray-tracing [T ~> s]
   real    :: uniform_test_cg !< Uniform group velocity of internal tide
                              !! for testing internal tides [L T-1 ~> m s-1]
   logical :: corner_adv      !< If true, use a corner advection rather than PPM.
@@ -130,7 +130,7 @@ type, public :: int_tide_CS ; private
   real, allocatable, dimension(:,:) :: tot_quad_loss !< Energy loss rates due to quadratic bottom drag,
                         !! summed over angle, frequency and mode [H Z2 T-3 ~> m3 s-3 or W m-2]
   real, allocatable, dimension(:,:) :: tot_itidal_loss !< Energy loss rates due to small-scale drag,
-                        !! summed over angle, frequency and mode [H Z2 T-3 ~>  m3 s-3 or W m-2]
+                        !! summed over angle, frequency and mode [H Z2 T-3 ~> m3 s-3 or W m-2]
   real, allocatable, dimension(:,:) :: tot_Froude_loss !< Energy loss rates due to wave breaking,
                         !! summed over angle, frequency and mode [H Z2 T-3 ~> m3 s-3 or W m-2]
   real, allocatable, dimension(:,:) :: tot_residual_loss !< Energy loss rates due to residual on slopes,
@@ -1363,7 +1363,7 @@ subroutine itidal_lowmode_loss(G, GV, US, CS, Nb, Rho_bot, Ub, En, TKE_loss_fixe
     if (En_tot > 0.0) then
       do a=1,CS%nAngle
         frac_per_sector = En(i,j,a,fr,m)/En_tot
-        TKE_loss(i,j,a,fr,m) = frac_per_sector*TKE_loss_tot           ! [H Z2 T-3  ~> m3 s-3 or W m-2]
+        TKE_loss(i,j,a,fr,m) = frac_per_sector*TKE_loss_tot           ! [H Z2 T-3 ~> m3 s-3 or W m-2]
         loss_rate = TKE_loss(i,j,a,fr,m) / (En(i,j,a,fr,m) + En_negl) ! [T-1 ~> s-1]
         En_b = En(i,j,a,fr,m)
         En_a = En(i,j,a,fr,m) / (1.0 + (dt*loss_rate))
@@ -1426,7 +1426,7 @@ subroutine get_lowmode_diffusivity(G, GV, h, tv, US, h_bot, k_bot, j, N2_lay, N2
                                                               !! dissipated within a layer and the
                                                               !! diapycnal diffusivity within that layer,
                                                               !! usually (~Rho_0 / (G_Earth * dRho_lay))
-                                                              !! [H Z T-1 / H Z2 T-3 = T2 Z-1 ~> s2 m-1]
+                                                              !! [T2 Z-1 ~> s2 m-1]
   real,                                 intent(in) :: Kd_max  !< The maximum increment for diapycnal
                                                               !! diffusivity due to TKE-based processes
                                                               !! [H Z T-1 ~> m2 s-1 or kg m-1 s-1].
@@ -1460,7 +1460,7 @@ subroutine get_lowmode_diffusivity(G, GV, h, tv, US, h_bot, k_bot, j, N2_lay, N2
                                                                       !! [H-1 ~> m-1 or m2 kg-1]
 
   ! local variables
-  real :: TKE_loss          ! temp variable to pass value of internal tides TKE loss [R Z-3 T-3 ~> W m-2]
+  real :: TKE_loss          ! temp variable to pass value of internal tides TKE loss [H Z2 T-3 ~> m3 s-3 or W m-2]
   real :: renorm_N          ! renormalization for N profile [H T-1 ~> m s-1 or kg m-2 s-1]
   real :: renorm_N2         ! renormalization for N2 profile [H T-2 ~> m s-2 or kg m-2 s-2]
   real :: tmp_StLau         ! tmp var for renormalization for StLaurent profile [nondim]
@@ -1655,23 +1655,23 @@ subroutine get_lowmode_diffusivity(G, GV, h, tv, US, h_bot, k_bot, j, N2_lay, N2
          enddo
 
          if (abs(verif_N -1.0) > threshold_verif) then
-           write(stdout,'(I5,I5,F18.10)') i, j, verif_N
+           write(stdout,'(I0,", ",I0,F18.10)') i, j, verif_N
            call MOM_error(FATAL, "mismatch integral for N profile")
          endif
          if (abs(verif_N2 -1.0) > threshold_verif) then
-           write(stdout,'(I5,I5,F18.10)') i, j, verif_N2
+           write(stdout,'(I0,", ",I0,F18.10)') i, j, verif_N2
            call MOM_error(FATAL, "mismatch integral for N2 profile")
          endif
          if (abs(verif_bbl -1.0) > threshold_verif) then
-           write(stdout,'(I5,I5,F18.10)') i, j, verif_bbl
+           write(stdout,'(I0,", ",I0,F18.10)') i, j, verif_bbl
            call MOM_error(FATAL, "mismatch integral for bbl profile")
          endif
          if (abs(verif_stl1 -1.0) > threshold_verif) then
-           write(stdout,'(I5,I5,F18.10)') i, j, verif_stl1
+           write(stdout,'(I0,", ",I0,F18.10)') i, j, verif_stl1
            call MOM_error(FATAL, "mismatch integral for stl1 profile")
          endif
          if (abs(verif_stl2 -1.0) > threshold_verif) then
-           write(stdout,'(I5,I5,F18.10)') i, j, verif_stl2
+           write(stdout,'(I0,", ",I0,F18.10)') i, j, verif_stl2
            call MOM_error(FATAL, "mismatch integral for stl2 profile")
          endif
 
@@ -3021,13 +3021,13 @@ subroutine PPM_reconstruction_x(h_in, h_l, h_r, G, LB, simple_2nd, adv_limiter)
 
   if ((isl-stencil < G%isd) .or. (iel+stencil > G%ied)) then
     write(mesg,'("In MOM_internal_tides, PPM_reconstruction_x called with a ", &
-               & "x-halo that needs to be increased by ",i2,".")') &
+               & "x-halo that needs to be increased by ",I0,".")') &
                stencil + max(G%isd-isl,iel-G%ied)
     call MOM_error(FATAL,mesg)
   endif
   if ((jsl < G%jsd) .or. (jel > G%jed)) then
     write(mesg,'("In MOM_internal_tides, PPM_reconstruction_x called with a ", &
-               & "y-halo that needs to be increased by ",i2,".")') &
+               & "y-halo that needs to be increased by ",I0,".")') &
                max(G%jsd-jsl,jel-G%jed)
     call MOM_error(FATAL,mesg)
   endif
@@ -3108,13 +3108,13 @@ subroutine PPM_reconstruction_y(h_in, h_l, h_r, G, LB, simple_2nd, adv_limiter)
 
   if ((isl < G%isd) .or. (iel > G%ied)) then
     write(mesg,'("In MOM_internal_tides, PPM_reconstruction_y called with a ", &
-               & "x-halo that needs to be increased by ",i2,".")') &
+               & "x-halo that needs to be increased by ",I0,".")') &
                max(G%isd-isl,iel-G%ied)
     call MOM_error(FATAL,mesg)
   endif
   if ((jsl-stencil < G%jsd) .or. (jel+stencil > G%jed)) then
     write(mesg,'("In MOM_internal_tides, PPM_reconstruction_y called with a ", &
-                 & "y-halo that needs to be increased by ",i2,".")') &
+                 & "y-halo that needs to be increased by ",I0,".")') &
                  stencil + max(G%jsd-jsl,jel-G%jed)
     call MOM_error(FATAL,mesg)
   endif
@@ -3773,7 +3773,7 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     ! Restrict RMS topographic roughness to a fraction (10 percent by default) of the column depth.
     if (RMS_roughness_frac >= 0.0) then
-      h2(i,j) = max(min((RMS_roughness_frac*(G%bathyT(i,j)+G%Z_ref))**2, h2(i,j)), 0.0)
+      h2(i,j) = max(min((RMS_roughness_frac * max(G%bathyT(i,j)+G%Z_ref, 0.0))**2, h2(i,j)), 0.0)
     else
       h2(i,j) = max(h2(i,j), 0.0)
     endif
