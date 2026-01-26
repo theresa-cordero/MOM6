@@ -381,7 +381,7 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
     call cpu_clock_end(id_clock_sync)
     num_itts = max(1, ceiling(max_CFL - 4.0*EPSILON(max_CFL)))
     I_numitts = 1.0 / (real(num_itts))
-    if (CS%id_CFL > 0) call post_data(CS%id_CFL, CFL, CS%diag, mask=G%mask2dT)
+    if (CS%id_CFL > 0) call post_data(CS%id_CFL, CFL, CS%diag)
   elseif (CS%max_diff_CFL > 0.0) then
     num_itts = max(1, ceiling(CS%max_diff_CFL - 4.0*EPSILON(CS%max_diff_CFL)))
     I_numitts = 1.0 / (real(num_itts))
@@ -657,7 +657,6 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
         enddo
       enddo
     endif
-    !call post_data(CS%id_KhTr_u, Kh_u, CS%diag, is_static=.false., mask=G%mask2dCu)
     call post_data(CS%id_KhTr_u, Kh_u, CS%diag)
   endif
   if (CS%id_KhTr_v > 0) then
@@ -673,7 +672,6 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
         enddo
       enddo
     endif
-    !call post_data(CS%id_KhTr_v, Kh_v, CS%diag, is_static=.false., mask=G%mask2dCv)
     call post_data(CS%id_KhTr_v, Kh_v, CS%diag)
   endif
   if (CS%id_KhTr_h > 0) then
@@ -697,7 +695,6 @@ subroutine tracer_hordiff(h, dt, MEKE, VarMix, visc, G, GV, US, CS, Reg, tv, do_
         enddo
       endif
     enddo ; enddo
-    !call post_data(CS%id_KhTr_h, Kh_h, CS%diag, is_static=.false., mask=G%mask2dT)
     call post_data(CS%id_KhTr_h, Kh_h, CS%diag)
   endif
 
