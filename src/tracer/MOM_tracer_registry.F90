@@ -475,20 +475,27 @@ subroutine register_tracer_diagnostics(Reg, h, Time, diag, G, GV, US, use_ALE, u
         trim(lowercase(flux_longname)), conv_units, v_extensive=.true., &
         conversion=Tr%conv_scale*US%s_to_T)
     Tr%id_difc_xy = register_diag_field('ocean_model',trim(shortnm)//"_diffusionc_xy", &
-        diag%axesTL, Time, "Horizontal convergence of residual mean diffusive fluxes of "//&
-        trim(shortnm)//' concentration', trim(units)//' s-1')
+        diag%axesTL, Time, &
+        "Horizontal convergence of residual mean diffusive fluxes of "//&
+        trim(shortnm)//' concentration', trim(units)//' s-1', &
+        conversion=Tr%conc_scale*US%s_to_T)
     Tr%id_dif_xy = register_diag_field('ocean_model',trim(shortnm)//"_diffusion_xy", &
-        diag%axesTL, Time, "Horizontal convergence of residual mean diffusive fluxes of "//trim(shortnm), &
-        conv_units, conversion=Tr%conv_scale*US%s_to_T)
+        diag%axesTL, Time, &
+        "Horizontal convergence of residual mean diffusive fluxes of "//&
+        trim(shortnm), conv_units, conversion=Tr%conv_scale*US%s_to_T)
     Tr%id_advc_xy = register_diag_field('ocean_model',trim(shortnm)//"_advectionc_xy", &
-        diag%axesTL, Time, "Horizontal convergence of residual mean advective fluxes of "//&
-        trim(shortnm)//' concentration', trim(units)//' s-1')
+        diag%axesTL, Time, &
+        "Horizontal convergence of residual mean advective fluxes of "//&
+        trim(shortnm)//' concentration', trim(units)//' s-1', &
+        conversion=Tr%conc_scale*US%s_to_T)
     Tr%id_advc_x  = register_diag_field("ocean_model",trim(shortnm)//'_advectionc_x', &
-        diag%axesTL, Time, "Horizontal x mean advective fluxes of "//trim(shortnm)//' concentration', &
-        trim(units)//' s-1')
+        diag%axesTL, Time, &
+        "Horizontal x mean advective fluxes of "//trim(shortnm)//' concentration', &
+        trim(units)//' s-1', conversion=Tr%conc_scale*US%s_to_T)
     Tr%id_advc_y  = register_diag_field("ocean_model",trim(shortnm)//'_advectionc_y', &
-        diag%axesTL, Time, "Horizontal y mean advective fluxes of "//trim(shortnm)//' concentration', &
-        trim(units)//' s-1')
+        diag%axesTL, Time, &
+        "Horizontal y mean advective fluxes of "//trim(shortnm)//' concentration', &
+        trim(units)//' s-1', conversion=Tr%conc_scale*US%s_to_T)
     Tr%id_adv_xy_2d = register_diag_field('ocean_model', trim(shortnm)//"_advection_xy_2d", &
         diag%axesT1, Time, &
         'Vertical sum of horizontal convergence of residual mean advective fluxes of '//&
