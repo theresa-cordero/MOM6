@@ -54,7 +54,8 @@ subroutine register_tracer(tr_ptr, Reg, param_file, HI, GV, name, longname, unit
                            cmor_name, cmor_units, cmor_longname, net_surfflux_name, &
                            NLT_budget_name, net_surfflux_longname, tr_desc, OBC_inflow, &
                            OBC_in_u, OBC_in_v, ad_x, ad_y, df_x, df_y, ad_2d_x, ad_2d_y, &
-                           df_2d_x, df_2d_y, advection_xy, registry_diags, &
+                           df_2d_x, df_2d_y, advection_xy, advectionc_xy, advectionc_x, advectionc_y, &
+                           diffusionc_xy, diffusion_xy, registry_diags, &
                            conc_scale, flux_nameroot, flux_longname, flux_units, flux_scale, &
                            convergence_units, convergence_scale, cmor_tendprefix, diag_form, &
                            restart_CS, mandatory, underflow_conc, Tr_out, advect_scheme)
