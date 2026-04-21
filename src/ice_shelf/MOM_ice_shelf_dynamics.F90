@@ -13,7 +13,7 @@ use MOM_IS_diag_mediator, only : register_diag_field=>register_MOM_IS_diag_field
 !use MOM_IS_diag_mediator, only : MOM_IS_diag_mediator_init, set_IS_diag_mediator_grid
 use MOM_IS_diag_mediator, only : diag_ctrl, time_type, enable_averages, disable_averaging
 use MOM_domains, only : MOM_domains_init, clone_MOM_domain
-use MOM_domains, only : pass_var, pass_vector, TO_ALL, CGRID_NE, BGRID_NE, CORNER, CENTER
+use MOM_domains, only : pass_var, pass_vector, TO_ALL, CGRID_NE, BGRID_NE, AGRID, CORNER, CENTER
 use MOM_error_handler, only : MOM_error, MOM_mesg, FATAL, WARNING, is_root_pe
 use MOM_file_parser, only : read_param, get_param, log_param, log_version, param_file_type
 use MOM_grid, only : MOM_grid_init, ocean_grid_type
@@ -94,6 +94,22 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:,:) :: ice_visc => NULL() !< Area and depth-integrated Glen's law ice viscosity
                                                         !!  (Pa m3 s) in [R L4 Z T-1 ~> kg m2 s-1].
                                                         !!  at either 1 (cell-centered) or 4 quadrature points per cell
+  real, pointer, dimension(:,:,:) :: newton_visc_factor => NULL() !< Newton tangent stiffness coefficient:
+                                                      !!  (1/n_glen - 1)/2 * ice_visc / eps_e2 at each
+                                                      !!  viscosity quadrature point [R L4 Z T ~> kg m2 s]
+  real, pointer, dimension(:,:,:) :: newton_str_ux => NULL() !< Longitudinal x-strain-rate ux at each viscosity
+                                                      !!  quadrature point for Newton iterations [T-1 ~> s-1]
+  real, pointer, dimension(:,:,:) :: newton_str_vy => NULL() !< Longitudinal y-strain-rate vy at each viscosity
+                                                      !!  quadrature point for Newton iterations [T-1 ~> s-1]
+  real, pointer, dimension(:,:,:) :: newton_str_sh => NULL() !< Engineering shear strain-rate uy+vx at each
+                                                      !!  viscosity quadrature point for Newton iterations [T-1 ~> s-1]
+  real, pointer, dimension(:,:) :: newton_umid => NULL() !< Cell-averaged zonal velocity u at the current outer
+                                                  !! iterate, for Newton basal drag correction [L T-1 ~> m s-1]
+  real, pointer, dimension(:,:) :: newton_vmid => NULL() !< Cell-averaged meridional velocity v at the current
+                                                  !! outer iterate, for Newton basal drag correction [L T-1 ~> m s-1]
+  real, pointer, dimension(:,:) :: newton_drag_coef => NULL() !< Newton basal drag correction coefficient:
+                                         !! 2 * d(basal_trac)/d(|u|^2) * area = d(tau_b_i)/d(u_j) - basal_trac*delta_ij
+                                         !! expressed as the u_i*u_j tensor coefficient [R Z T ~> kg m-2 s]
   real, pointer, dimension(:,:) :: AGlen_visc => NULL() !< Ice-stiffness parameter in Glen's law ice viscosity,
                                                       !! often in [Pa-3 s-1] if n_Glen is 3.
   real, pointer, dimension(:,:) :: u_bdry_val => NULL() !< The zonal ice velocity at inflowing boundaries
@@ -126,6 +142,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                                 !! 4 quadrature points surrounding the cell vertices [L-1 ~> m-1].
   real, pointer, dimension(:,:,:) :: PhiC => NULL()  !< The gradients of bilinear basis elements at 1 cell-centered
                                                 !! quadrature point per cell [L-1 ~> m-1].
+  real, pointer, dimension(:,:,:) :: Jac => NULL()   !< Jacobian determinant |J_q| = a_q*d_q of the element
+                                                !! mapping at each of the 4 Gaussian quadrature points [L2 ~> m2].
+                                                !! Equal to G%areaT only for rectangular elements; differs when
+                                                !! opposite cell edges have unequal lengths (non-rectangular quads).
   real, pointer, dimension(:,:,:,:,:,:) :: Phisub => NULL() !< Quadrature structure weights at subgridscale
                                                 !!  locations for finite element calculations [nondim]
   integer :: OD_rt_counter = 0 !< A counter of the number of contributions to OD_rt.
@@ -196,8 +216,12 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
   real :: cg_tolerance !< The tolerance in the CG solver, relative to initial residual, that
                        !! determines when to stop the conjugate gradient iterations [nondim].
+  real :: cg_tol_newton !< Working CG tolerance for the current inner solve [nondim].
   real :: nonlinear_tolerance !< The fractional nonlinear tolerance, relative to the initial error,
                               !! that sets when to stop the iterative velocity solver [nondim]
+  real :: newton_after_tolerance !< The fractional nonlinear tolerance, relative to the initial error, at
+                                 !! which to switch from Picard to Newton iterations in the velocity solver [nondim]
+  logical :: newton_adapt_cg_tol !< Use an adaptive CG tolerance during Newton iterations
   integer :: cg_max_iterations !< The maximum number of iterations that can be used in the CG solver
   integer :: nonlin_solve_err_mode  !< 1: exit vel solve based on nonlin residual
                     !! 2: exit based on "fixed point" metric (|u - u_last| / |u| < tol) where | | is infty-norm
@@ -229,6 +253,8 @@ type, public :: ice_shelf_dyn_CS ; private
 
   logical :: debug                !< If true, write verbose checksums for debugging purposes
                                   !! and use reproducible sums
+  logical :: doing_newton = .false. !< If true, the outer iteration is using Newton (tangent) linearization
+                                    !! instead of Picard (secant) linearization for the ice viscosity
   logical :: module_is_initialized = .false. !< True if this module has been initialized.
 
   !>@{ Diagnostic handles
@@ -255,9 +281,10 @@ end type ice_shelf_dyn_CS
 
 !> A container for loop bounds
 type :: loop_bounds_type ; private
-  !>@{ Loop bounds
-  integer :: ish, ieh, jsh, jeh
-  !>@}
+  integer :: ish !< Starting i-index of the computational domain [nondim]
+  integer :: ieh !< Ending i-index of the computational domain [nondim]
+  integer :: jsh !< Starting j-index of the computational domain [nondim]
+  integer :: jeh !< Ending j-index of the computational domain [nondim]
 end type loop_bounds_type
 
 contains
@@ -362,6 +389,13 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%v_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%t_shelf(isd:ied,jsd:jed), source=T_shelf_missing) ! [C ~> degC]
     allocate(CS%ice_visc(isd:ied,jsd:jed,CS%visc_qps), source=0.0)
+    allocate(CS%newton_visc_factor(isd:ied,jsd:jed,CS%visc_qps), source=0.0)
+    allocate(CS%newton_str_ux(isd:ied,jsd:jed,CS%visc_qps), source=0.0)
+    allocate(CS%newton_str_vy(isd:ied,jsd:jed,CS%visc_qps), source=0.0)
+    allocate(CS%newton_str_sh(isd:ied,jsd:jed,CS%visc_qps), source=0.0)
+    allocate(CS%newton_umid(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%newton_vmid(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%newton_drag_coef(isd:ied,jsd:jed), source=0.0)
     allocate(CS%AGlen_visc(isd:ied,jsd:jed), source=2.261e-25) ! [Pa-3 s-1]
     allocate(CS%basal_traction(isd:ied,jsd:jed), source=0.0)   ! [R Z L2 T-1 ~> kg s-1]
     allocate(CS%C_basal_friction(isd:ied,jsd:jed), source=5.0e10*US%Pa_to_RLZ_T2)
@@ -556,8 +590,15 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "A typical density of ice.", units="kg m-3", default=917.0, scale=US%kg_m3_to_R)
     call get_param(param_file, mdl, "CONJUGATE_GRADIENT_TOLERANCE", CS%cg_tolerance, &
                 "tolerance in CG solver, relative to initial residual", units="nondim", default=1.e-6)
+    CS%cg_tol_newton = CS%cg_tolerance  ! Will be tightened adaptively during Newton iterations
     call get_param(param_file, mdl, "ICE_NONLINEAR_TOLERANCE", CS%nonlinear_tolerance, &
                 "nonlin tolerance in iterative velocity solve", units="nondim", default=1.e-6)
+    call get_param(param_file, mdl, "NEWTON_AFTER_TOLERANCE", CS%newton_after_tolerance, &
+                "Switch from Picard to Newton iterations in the nonlinear ice velocity solve when "//&
+                "the fractional nonlinear residual falls below this tolerance.",&
+                units="none", default=CS%nonlinear_tolerance)
+    call get_param(param_file, mdl, "NEWTON_ADAPT_CG_TOL", CS%newton_adapt_cg_tol, &
+                "Use an adaptive CG tolerance during Newton iterations.", default=.true.)
     call get_param(param_file, mdl, "CONJUGATE_GRADIENT_MAXIT", CS%cg_max_iterations, &
                 "max iteratiions in CG solver", default=2000)
     call get_param(param_file, mdl, "THRESH_FLOAT_COL_DEPTH", CS%thresh_float_col_depth, &
@@ -671,8 +712,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     endif
 
     allocate(CS%Phi(1:8,1:4,isd:ied,jsd:jed), source=0.0)
+    allocate(CS%Jac(1:4,isd:ied,jsd:jed), source=0.0)
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
-      call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j))
+      call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j), CS%Jac(:,i,j))
     enddo; enddo
 
     if (CS%GL_regularize) then
@@ -685,7 +727,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       allocate(CS%PhiC(1:8,G%isc:G%iec,G%jsc:G%jec), source=0.0)
       do j=G%jsc,G%jec ; do i=G%isc,G%iec
         call bilinear_shape_fn_grid_1qp(G, i, j, CS%PhiC(:,i,j))
-      enddo; enddo
+      enddo ; enddo
     endif
 
     CS%elapsed_velocity_time = 0.0
@@ -1048,19 +1090,19 @@ subroutine volume_above_floatation(CS, G, ISS, vaf, hemisphere)
 
   mask(:,:)=0
   if (IS_ID==0) then     !Antarctica (S. Hemisphere) only
-    do j = js,je; do i = is,ie
+    do j = js,je ; do i = is,ie
       if (ISS%hmask(i,j)>0 .and. G%geoLatT(i,j)<=0.0) mask(i,j)=1
-    enddo; enddo
+    enddo ; enddo
   elseif (IS_ID==1) then !Greenland (N. Hemisphere) only
-    do j = js,je; do i = is,ie
+    do j = js,je ; do i = is,ie
       if (ISS%hmask(i,j)>0 .and. G%geoLatT(i,j)>0.0)  mask(i,j)=1
-    enddo; enddo
+    enddo ; enddo
   else                   !All ice sheets
     mask(is:ie,js:je)=ISS%hmask(is:ie,js:je)
   endif
 
   vaf_cell(:,:)=0.0
-  do j = js,je; do i = is,ie
+  do j = js,je ; do i = is,ie
     if (mask(i,j)>0) then
       if (CS%bed_elev(i,j) <= 0) then
         !grounded above sea level
@@ -1070,7 +1112,7 @@ subroutine volume_above_floatation(CS, G, ISS, vaf, hemisphere)
         vaf_cell(i,j) = max(ISS%h_shelf(i,j) - rhow_rhoi * CS%bed_elev(i,j), 0.0) * ISS%area_shelf_h(i,j)
       endif
     endif
-  enddo; enddo
+  enddo ; enddo
 
   vaf = reproducing_sum(vaf_cell, unscale=G%US%Z_to_m*G%US%L_to_m**2)
 end subroutine volume_above_floatation
@@ -1081,10 +1123,10 @@ subroutine masked_var_grounded(G,CS,var,varout)
   type(ice_shelf_dyn_CS), intent(in) :: CS !< The ice shelf dynamics control structure
   real, dimension(SZI_(G),SZJ_(G)), intent(in)  :: var !< variable in
   real, dimension(SZI_(G),SZJ_(G)), intent(out)  :: varout !<variable out
-  integer :: i,j
-  do j = G%jsc,G%jec; do i = G%isc,G%iec
+  integer :: i, j
+  do j = G%jsc,G%jec ; do i = G%isc,G%iec
       varout(i,j) = var(i,j) * CS%ground_frac(i,j)
-  enddo; enddo
+  enddo ; enddo
 end subroutine masked_var_grounded
 
 !> Ice shelf dynamics post_data calls
@@ -1264,7 +1306,7 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, area, day, time_step)
     tmp1(i,j) = 0.03125 * (mass(i,j) * area(i,j)) * &
       ((((CS%u_shelf(I-1,J-1)+CS%u_shelf(I,J))+(CS%u_shelf(I,J-1)+CS%u_shelf(I-1,J)))**2) + &
        (((CS%v_shelf(I-1,J-1)+CS%v_shelf(I,J))+(CS%v_shelf(I,J-1)+CS%v_shelf(I-1,J)))**2))
-  enddo; enddo
+  enddo ; enddo
 
   KE_tot = reproducing_sum(tmp1, isr, ier, jsr, jer, unscale=(US%RZL2_to_kg*US%L_T_to_m_s**2))
 
@@ -1272,7 +1314,7 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, area, day, time_step)
   tmp1(:,:) = 0.0
   do j=js,je ; do i=is,ie
     tmp1(i,j) = mass(i,j) * area(i,j)
-  enddo; enddo
+  enddo ; enddo
 
   mass_tot = reproducing_sum(tmp1, isr, ier, jsr, jer, unscale=US%RZL2_to_kg)
 
@@ -1408,23 +1450,23 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice)
     !add mass of the partially-filled cells to calving field, which is used to initialize icebergs
     !Then, remove the partially-filled cells from the ice shelf
-    ISS%calving(:,:)=0.0
-    ISS%calving_hflx(:,:)=0.0
-    do j=jsc,jec; do i=isc,iec
+    ISS%calving(:,:) = 0.0
+    ISS%calving_hflx(:,:) = 0.0
+    do j=jsc,jec ; do i=isc,iec
       if (ISS%hmask(i,j)==2) then
         ISS%calving(i,j) = (ISS%h_shelf(i,j) * CS%density_ice) * &
                            (ISS%area_shelf_h(i,j) * G%IareaT(i,j)) / time_step
         ISS%calving_hflx(i,j) = (CS%Cp_ice * CS%t_shelf(i,j)) * &
                                 ((ISS%h_shelf(i,j) * CS%density_ice) * &
                                 (ISS%area_shelf_h(i,j) * G%IareaT(i,j)))
-        ISS%h_shelf(i,j) = 0.0; ISS%area_shelf_h(i,j) = 0.0; ISS%hmask(i,j) = 0.0
+        ISS%h_shelf(i,j) = 0.0 ; ISS%area_shelf_h(i,j) = 0.0 ; ISS%hmask(i,j) = 0.0
       endif
-    enddo; enddo
+    enddo ; enddo
   endif
 
-  do j=jsc,jec; do i=isc,iec
+  do j=jsc,jec ; do i=isc,iec
     ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * CS%density_ice
-  enddo; enddo
+  enddo ; enddo
 
   call pass_var(ISS%mass_shelf, G%domain, complete=.false.)
   call pass_var(ISS%h_shelf, G%domain, complete=.false.)
@@ -1467,6 +1509,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   integer :: Isdq, Iedq, Jsdq, Jedq, isd, ied, jsd, jed
   integer :: Iscq, Iecq, Jscq, Jecq, isc, iec, jsc, jec
   real    :: err_max, err_tempu, err_tempv, err_init ! Errors in [R L3 Z T-2 ~> kg m s-2] or [L T-1 ~> m s-1]
+  real    :: ew_prev_err  ! Previous outer residual for Eisenstat-Walker CG tolerance (same units as err_max)
   real    :: max_vel  ! The maximum velocity magnitude [L T-1 ~> m s-1]
   real    :: tempu, tempv   ! Temporary variables with velocity magnitudes [L T-1 ~> m s-1]
   real    :: Norm, PrevNorm ! Velocities used to assess convergence [L T-1 ~> m s-1]
@@ -1551,7 +1594,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
     call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
                    CS%ice_visc, CS%float_cond, CS%bed_elev, CS%basal_traction, &
-                   G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow)
+                   G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false.)
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
     err_init = 0 ; err_tempu = 0 ; err_tempv = 0
@@ -1592,6 +1635,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   endif
 
   u_last(:,:) = u_shlf(:,:) ; v_last(:,:) = v_shlf(:,:)
+  CS%cg_tol_newton = CS%cg_tolerance
+  ew_prev_err = err_init
 
   !! begin loop
 
@@ -1611,7 +1656,12 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     call calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
     call pass_var(CS%basal_traction, G%domain, complete=.true.)
     call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
-    call pass_var(CS%ice_visc, G%domain)
+    call pass_var(CS%ice_visc, G%domain, complete=.false.)
+    call pass_var(CS%newton_str_sh, G%domain, complete=.false.)
+    call pass_var(CS%newton_visc_factor, G%domain, complete=.true.)
+    call pass_var(CS%newton_drag_coef, G%domain)
+    call pass_vector(CS%newton_str_ux, CS%newton_str_vy, G%domain, TO_ALL, AGRID)
+    call pass_vector(CS%newton_umid, CS%newton_vmid, G%domain, TO_ALL, AGRID)
 
     ! makes sure basal stress is only applied when it is supposed to be
     if (CS%GL_regularize) then
@@ -1630,7 +1680,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
       call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
                      CS%ice_visc, CS%float_cond, CS%bed_elev, CS%basal_traction, &
-                     G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow)
+                     G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false.)
 
       call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
@@ -1680,7 +1730,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
       do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
         if (CS%umask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + u_shlf(I,J)**2
         if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + v_shlf(I,J)**2
-      enddo; enddo
+      enddo ; enddo
       Norm = sqrt( reproducing_sum( Normvec, Is_sum, Ie_sum, Js_sum, Je_sum, unscale=US%L_T_to_m_s**2 ) )
       err_max = 2.*abs(Norm-PrevNorm) ; err_init = Norm+PrevNorm
     endif
@@ -1688,11 +1738,30 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     write(mesg,*) "ice_shelf_solve_outer: nonlinear fractional residual = ", err_max/err_init
     call MOM_mesg(mesg, 5)
 
+    if (err_max <= CS%newton_after_tolerance * err_init .and. .not. CS%doing_newton) then
+      CS%doing_newton = .true.
+      ew_prev_err = err_max  ! seed Eisenstat-Walker with residual at the Newton switch point
+      write(mesg,*) "ice_shelf_solve_outer: switching to Newton iterations at iter = ", iter
+      call MOM_mesg(mesg, 5)
+    endif
+
+    ! Eisenstat-Walker Choice II (Eisenstat & Walker 1994): η_k = γ*(||F_k||/||F_{k-1}||)^α
+    ! with γ=0.9, α=2.  Uses the ratio of consecutive outer residuals so that the CG
+    ! tolerance scales linearly with the current error (enabling quadratic outer convergence)
+    ! without over-tightening at later Newton steps.  The first Newton step uses the standard
+    ! cg_tolerance (ratio = 1 on entry).
+    if (CS%doing_newton .and. CS%newton_adapt_cg_tol) then
+      CS%cg_tol_newton = min(CS%cg_tolerance, 0.9 * (err_max / ew_prev_err)**2)
+      ew_prev_err = err_max
+    endif
+
     if (err_max <= CS%nonlinear_tolerance * err_init) then
       exit
     endif
 
   enddo
+  CS%doing_newton = .false.
+  CS%cg_tol_newton = CS%cg_tolerance
 
   write(mesg,*) "ice_shelf_solve_outer: nonlinear fractional residual = ", err_max/err_init
   call MOM_mesg(mesg)
@@ -1813,7 +1882,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
 
   call CG_action(CS, Au, Av, u_shlf, v_shlf, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                  H_node, CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
-                 G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow)
+                 G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, use_newton_in=.false.)
 
   call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE, complete=.true.)
 
@@ -1828,7 +1897,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   enddo ; enddo
 
   !resid0 = sqrt(reproducing_sum( sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum ))
-  resid0tol2 = CS%cg_tolerance**2 * reproducing_sum( sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum )
+  resid0tol2 = CS%cg_tol_newton**2 * reproducing_sum( sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum )
 
   do J=Jsdq,Jedq ; do I=Isdq,Iedq
     if (CS%umask(I,J) == 1 .AND.(DIAGu(I,J)/=0)) Zu(I,J) = Ru(I,J) / DIAGu(I,J)
@@ -1901,13 +1970,13 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
         Rv(I,J) = Rv(I,J) - alpha_k * Av(I,J)
         if (DIAGv(I,J)/=0) Zv(I,J) = Rv(I,J) / DIAGv(I,J)
       endif
-    enddo; enddo
+    enddo ; enddo
 
 
     ! R,u,v,Z valid region moves in by 1
 
     ! beta_k = (Z \dot R) / (Zold \dot Rold)
-    sum_vec_3d(:,:,:) = 0.0; sv3dsums(:)=0.0
+    sum_vec_3d(:,:,:) = 0.0 ; sv3dsums(:) = 0.0
 
     do J=jscq_sv,jecq ; do i=iscq_sv,iecq
       if (CS%umask(I,J) == 1) then
@@ -2443,7 +2512,7 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   gisc = 1 ; gjsc = 1
 !  giec = G%domain%niglobal+G%domain%nihalo ; gjec = G%domain%njglobal+G%domain%njhalo
   giec = G%domain%niglobal ; gjec = G%domain%njglobal
-!  is = iscq - 1; js = jscq - 1
+!  is = iscq - 1 ; js = jscq - 1
   i_off = G%idg_offset ; j_off = G%jdg_offset
 
 
@@ -2602,11 +2671,11 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   do J=jsc-1,jec ; do I=isc-1,iec
     taudx(I,J) = taudx(I,J) + ((sx_e(i,j)+sx_e(i+1,j+1)) + (sx_e(i+1,j)+sx_e(i,j+1)))
     taudy(I,J) = taudy(I,J) + ((sy_e(i,j)+sy_e(i+1,j+1)) + (sy_e(i+1,j)+sy_e(i,j+1)))
-  enddo; enddo
+  enddo ; enddo
 end subroutine calc_shelf_driving_stress
 
 subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, hmask, H_node, &
-                     ice_visc, float_cond, bathyT, basal_trac, G, US, is, ie, js, je, dens_ratio)
+                     ice_visc, float_cond, bathyT, basal_trac, G, US, is, ie, js, je, dens_ratio, use_newton_in)
 
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ocean_grid_type), intent(in) :: G  !< The grid structure used by the ice shelf.
@@ -2656,6 +2725,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   integer,               intent(in)    :: ie  !< The ending i-index to work on
   integer,               intent(in)    :: js  !< The starting j-index to work on
   integer,               intent(in)    :: je  !< The ending j-index to work on
+  logical, optional,     intent(in)    :: use_newton_in !< If present, overrides CS%doing_newton for Newton correction
 
 ! the linear action of the matrix on (u,v) with bilinear finite elements
 ! as of now everything is passed in so no grid pointers or anything of the sort have to be dereferenced,
@@ -2678,8 +2748,12 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
 
   real :: ux, uy, vx, vy ! Components of velocity shears or divergence [T-1 ~> s-1]
   real :: uq, vq  ! Interpolated velocities [L T-1 ~> m s-1]
+  real :: strx_n, stry_n, strsh_n, dstrain_n, inner_dot_n  ! Newton correction variables [T-1 ~> s-1], [T-2 ~> s-2]
+  real :: jac_wt  ! Per-quadrature-point metric correction |J_q|/areaT [nondim]
   integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt, qp, qpv
   logical :: visc_qp4
+  logical :: use_newton  ! Whether to apply Newton tangent stiffness corrections
+  logical :: do_newton_visc  ! Whether to apply viscosity-related Newton tangent stiffness corrections
   real, dimension(2) :: xquad  ! Nondimensional quadrature ratios [nondim]
   real, dimension(2,2) :: Ucell, Vcell, Usub, Vsub  ! Velocities at the nodal points around the cell [L T-1 ~> m s-1]
   real, dimension(2,2) :: Hcell   ! Ice shelf thickness at notal (corner) points [Z ~> m]
@@ -2695,12 +2769,16 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
     qpv = 1
   endif
 
-  uret(:,:) = 0.0; vret(:,:)=0.0
-  uret_b(:,:,:)=0.0 ; vret_b(:,:,:)=0.0
+  use_newton = CS%doing_newton
+  if (present(use_newton_in)) use_newton = use_newton_in
+  do_newton_visc = use_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
+
+  uret(:,:) = 0.0 ; vret(:,:) = 0.0
+  uret_b(:,:,:) = 0.0 ; vret_b(:,:,:) = 0.0
 
   do j=js,je ; do i=is,ie ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
 
-    uret_qp(:,:,:)=0.0; vret_qp(:,:,:)=0.0
+    uret_qp(:,:,:) = 0.0 ; vret_qp(:,:,:) = 0.0
 
       do iq=1,2 ; do jq=1,2
 
@@ -2738,21 +2816,58 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
 
         if (visc_qp4) qpv = qp !current quad point for viscosity
 
+        ! Newton correction: compute dstrain scalar once per quadrature point
+        if (do_newton_visc) then
+          strx_n = CS%newton_str_ux(i,j,qpv)
+          stry_n = CS%newton_str_vy(i,j,qpv)
+          strsh_n = CS%newton_str_sh(i,j,qpv)
+          dstrain_n = (((2.*strx_n + stry_n)*ux) + ((2.*stry_n + strx_n)*vy)) + &
+                      strsh_n * (uy + vx) * 0.5
+        endif
+
+        ! Newton correction for basal drag: compute inner_dot_n once per quadrature point
+        if (use_newton) then
+          inner_dot_n = CS%newton_umid(i,j)*uq + CS%newton_vmid(i,j)*vq
+        endif
+
+        ! Ratio |J_q|/areaT corrects the uniform-area weight baked into ice_visc for
+        ! non-rectangular elements where opposite cell edges have unequal lengths.
+        jac_wt = CS%Jac(qp,i,j) * G%IareaT(i,j)
+
         do jphi=1,2 ; Jtgt = J-2+jphi ; do iphi=1,2 ; Itgt = I-2+iphi
-          if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = ice_visc(i,j,qpv) * &
+          if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = jac_wt * ice_visc(i,j,qpv) * &
             (((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)) + &
             ((uy+vx) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
-          if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = ice_visc(i,j,qpv) * &
+          if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = jac_wt * ice_visc(i,j,qpv) * &
             (((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)) + &
             ((4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
+
+          ! Newton tangent stiffness correction: add (dη/dε_e^2) * (g·δε) * (g·φ_m) term
+          if (do_newton_visc) then
+            if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) + &
+             jac_wt * CS%newton_visc_factor(i,j,qpv) * dstrain_n * &
+              ((2.*strx_n + stry_n) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
+               strsh_n * 0.5 * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
+            if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = vret_qp(iphi,jphi,qp) + &
+              jac_wt * CS%newton_visc_factor(i,j,qpv) * dstrain_n * &
+              (strsh_n * 0.5 * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
+               (2.*stry_n + strx_n) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
+          endif
 
           if (float_cond(i,j) == 0) then
             ilq = 1 ; if (iq == iphi) ilq = 2
             jlq = 1 ; if (jq == jphi) jlq = 2
             if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) +  &
-              ((basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq)))
+              (jac_wt * (basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq)))
             if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = vret_qp(iphi,jphi,qp) +  &
-              ((basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq)))
+              (jac_wt * (basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq)))
+            ! Newton basal drag tangent stiffness: (m-1)*basal_trac/|u|^2 * u_i * (u . delta_u) contribution
+            if (use_newton) then
+              if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) + &
+                jac_wt * CS%newton_drag_coef(i,j) * CS%newton_umid(i,j) * inner_dot_n * (xquad(ilq) * xquad(jlq))
+              if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = vret_qp(iphi,jphi,qp) + &
+                jac_wt * CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j) * inner_dot_n * (xquad(ilq) * xquad(jlq))
+            endif
           endif
         enddo ; enddo
       enddo ; enddo
@@ -2778,7 +2893,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         Hcell(:,:) = H_node(I-1:I,J-1:J)
 
         call CG_action_subgrid_basal(Phisub, Hcell, Ucell, Vcell, &
-                                     bathyT(i,j), dens_ratio, Usub, Vsub)
+                                     bathyT(i,j), dens_ratio, Usub, Vsub, &
+                                     G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j))
 
         if (umask(I-1,J-1) == 1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + (Usub(1,1) * basal_trac(i,j))
         if (umask(I-1,J  ) == 1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + (Usub(1,2) * basal_trac(i,j))
@@ -2789,17 +2905,42 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         if (vmask(I-1,J  ) == 1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + (Vsub(1,2) * basal_trac(i,j))
         if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + (Vsub(2,1) * basal_trac(i,j))
         if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + (Vsub(2,2) * basal_trac(i,j))
+
+        ! Newton basal drag correction for subgrid grounding line cells.
+        ! inner_dot_sub(m,n) = sum over grounded sub-QPs of (u^k . delta_u) * phi_{m,n} * weight
+        !                    = newton_umid * Usub(m,n) + newton_vmid * Vsub(m,n)
+        ! Correction to u-node (m,n): newton_drag_coef * newton_umid * inner_dot_sub(m,n)
+        ! Correction to v-node (m,n): newton_drag_coef * newton_vmid * inner_dot_sub(m,n)
+        if (use_newton) then
+          if (umask(I-1,J-1)==1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + CS%newton_drag_coef(i,j) * &
+            CS%newton_umid(i,j) * ((CS%newton_umid(i,j)*Usub(1,1)) + (CS%newton_vmid(i,j)*Vsub(1,1)))
+          if (umask(I-1,J  )==1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + CS%newton_drag_coef(i,j) * &
+            CS%newton_umid(i,j) * ((CS%newton_umid(i,j)*Usub(1,2)) + (CS%newton_vmid(i,j)*Vsub(1,2)))
+          if (umask(I  ,J-1)==1) uret_b(I  ,J-1,3) = uret_b(I  ,J-1,3) + CS%newton_drag_coef(i,j) * &
+            CS%newton_umid(i,j) * ((CS%newton_umid(i,j)*Usub(2,1)) + (CS%newton_vmid(i,j)*Vsub(2,1)))
+          if (umask(I  ,J  )==1) uret_b(I  ,J  ,1) = uret_b(I  ,J  ,1) + CS%newton_drag_coef(i,j) * &
+            CS%newton_umid(i,j) * ((CS%newton_umid(i,j)*Usub(2,2)) + (CS%newton_vmid(i,j)*Vsub(2,2)))
+          if (vmask(I-1,J-1)==1) vret_b(I-1,J-1,4) = vret_b(I-1,J-1,4) + CS%newton_drag_coef(i,j) * &
+            CS%newton_vmid(i,j) * ((CS%newton_umid(i,j)*Usub(1,1)) + (CS%newton_vmid(i,j)*Vsub(1,1)))
+          if (vmask(I-1,J  )==1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + CS%newton_drag_coef(i,j) * &
+            CS%newton_vmid(i,j) * ((CS%newton_umid(i,j)*Usub(1,2)) + (CS%newton_vmid(i,j)*Vsub(1,2)))
+          if (vmask(I  ,J-1)==1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + CS%newton_drag_coef(i,j) * &
+            CS%newton_vmid(i,j) * ((CS%newton_umid(i,j)*Usub(2,1)) + (CS%newton_vmid(i,j)*Vsub(2,1)))
+          if (vmask(I  ,J  )==1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + CS%newton_drag_coef(i,j) * &
+            CS%newton_vmid(i,j) * ((CS%newton_umid(i,j)*Usub(2,2)) + (CS%newton_vmid(i,j)*Vsub(2,2)))
+        endif
       endif
   endif ; enddo ; enddo
 
   do J=js-1,je ; do I=is-1,ie
     uret(I,J) = (uret_b(I,J,1)+uret_b(I,J,4)) + (uret_b(I,J,2)+uret_b(I,J,3))
     vret(I,J) = (vret_b(I,J,1)+vret_b(I,J,4)) + (vret_b(I,J,2)+vret_b(I,J,3))
-  enddo; enddo
+  enddo ; enddo
 
 end subroutine CG_action
 
-subroutine CG_action_subgrid_basal(Phisub, H, U, V, bathyT, dens_ratio, Ucontr, Vcontr)
+subroutine CG_action_subgrid_basal(Phisub, H, U, V, bathyT, dens_ratio, Ucontr, Vcontr, &
+                                    dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT)
   real, dimension(:,:,:,:,:,:), &
                         intent(in)    :: Phisub !< Quadrature structure weights at subgridscale
                                             !! locations for finite element calculations [nondim]
@@ -2814,22 +2955,29 @@ subroutine CG_action_subgrid_basal(Phisub, H, U, V, bathyT, dens_ratio, Ucontr, 
                                             !! is grounded, or 0 where it is floating [L T-1 ~> m s-1].
   real, dimension(2,2), intent(out)   :: Vcontr !< The areal average of v-velocities where the ice shelf
                                             !! is grounded, or 0 where it is floating [L T-1 ~> m s-1].
+  real,                 intent(in)    :: dxCv_S !< The cell width at the southern (v-point) edge [L ~> m]
+  real,                 intent(in)    :: dxCv_N !< The cell width at the northern (v-point) edge [L ~> m]
+  real,                 intent(in)    :: dyCu_W !< The cell height at the western (u-point) edge [L ~> m]
+  real,                 intent(in)    :: dyCu_E !< The cell height at the eastern (u-point) edge [L ~> m]
+  real,                 intent(in)    :: IareaT !< The inverse of the cell area at the tracer point [L-2 ~> m-2]
 
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: Ucontr_sub, Vcontr_sub ! The contributions to Ucontr and Vcontr
                                                                                !! at each sub-cell
   real, dimension(2,2,SIZE(Phisub,3),SIZE(Phisub,3)) :: uloc_arr !The local sub-cell u-velocity [L T-1 ~> m s-1]
   real, dimension(2,2,SIZE(Phisub,3),SIZE(Phisub,3)) :: vloc_arr !The local sub-cell v-velocity [L T-1 ~> m s-1]
   real, dimension(2,2) :: Ucontr_q, Vcontr_q !Contributions to a node from each quadrature point in a sub-grid cell
-  real    :: subarea ! The fractional sub-cell area [nondim]
-  real    :: hloc    ! The local sub-cell ice thickness [Z ~> m]
+  real    :: jac_sub_wt ! Per-sub-cell-QP metric correction |J_sub|/areaT [nondim]
+  real    :: a, d      ! Interpolated cell-edge spacings at the sub-cell QP [L ~> m]
+  real    :: subarea   ! The fractional sub-cell area in reference space [nondim]
+  real    :: hloc      ! The local sub-cell ice thickness [Z ~> m]
   integer :: nsub, i, j, qx, qy, m, n
 
   nsub = size(Phisub,3)
-  subarea = 1.0 / (nsub**2)
+  subarea = 1.0 / real(nsub)**2
 
-  uloc_arr(:,:,:,:) = 0.0; vloc_arr(:,:,:,:)=0.0
+  uloc_arr(:,:,:,:) = 0.0 ; vloc_arr(:,:,:,:)=0.0
 
-  do j=1,nsub ; do i=1,nsub;  do qy=1,2 ; do qx=1,2
+  do j=1,nsub ; do i=1,nsub ; do qy=1,2 ; do qx=1,2
     hloc = ((Phisub(qx,qy,i,j,1,1)*H(1,1)) + (Phisub(qx,qy,i,j,2,2)*H(2,2))) + &
            ((Phisub(qx,qy,i,j,1,2)*H(1,2)) + (Phisub(qx,qy,i,j,2,1)*H(2,1)))
     if (dens_ratio * hloc - bathyT > 0) then
@@ -2838,18 +2986,28 @@ subroutine CG_action_subgrid_basal(Phisub, H, U, V, bathyT, dens_ratio, Ucontr, 
       vloc_arr(qx,qy,i,j) = (((Phisub(qx,qy,i,j,1,1) * V(1,1)) + (Phisub(qx,qy,i,j,2,2) * V(2,2))) + &
                              ((Phisub(qx,qy,i,j,1,2) * V(1,2)) + (Phisub(qx,qy,i,j,2,1) * V(2,1))))
     endif
-  enddo; enddo ; enddo ; enddo
+  enddo ; enddo ; enddo ; enddo
 
   do n=1,2 ; do m=1,2 ; do j=1,nsub ; do i=1,nsub
     do qy=1,2 ; do qx=1,2
+      ! Interpolate cell-edge metrics to the sub-cell QP using the bilinear shape function values
+      ! from bilinear_shape_functions_subgrid.  Marginal sums of Phisub give the interpolation
+      ! weights: sum over k=1 nodes gives (1-y); k=2 gives y; l=1 gives (1-x); l=2 gives x.
+      ! This is analogous to jac_wt = CS%Jac(qp,i,j) * G%IareaT(i,j) in the regular routines.
+      a = dxCv_S * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1)) + &  ! (1-y) * dxCv_S
+          dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2))        ! + y * dxCv_N
+      d = dyCu_W * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2)) + &  ! (1-x) * dyCu_W
+          dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2))        ! + x * dyCu_E
+      jac_sub_wt = 0.25 * subarea * (a * d) * IareaT
+
       !calculate quadrature point contributions for the sub-cell, to each node
-        Ucontr_q(qx,qy) = Phisub(qx,qy,i,j,m,n) * uloc_arr(qx,qy,i,j)
-        Vcontr_q(qx,qy) = Phisub(qx,qy,i,j,m,n) * vloc_arr(qx,qy,i,j)
+      Ucontr_q(qx,qy) = jac_sub_wt * Phisub(qx,qy,i,j,m,n) * uloc_arr(qx,qy,i,j)
+      Vcontr_q(qx,qy) = jac_sub_wt * Phisub(qx,qy,i,j,m,n) * vloc_arr(qx,qy,i,j)
     enddo; enddo
 
     !calculate sub-cell contribution to each node by summing up quadrature point contributions from the sub-cell
-    Ucontr_sub(i,j,m,n) = (subarea * 0.25) * ((Ucontr_q(1,1) + Ucontr_q(2,2)) + (Ucontr_q(1,2)+Ucontr_q(2,1)))
-    Vcontr_sub(i,j,m,n) = (subarea * 0.25) * ((Vcontr_q(1,1) + Vcontr_q(2,2)) + (Vcontr_q(1,2)+Vcontr_q(2,1)))
+    Ucontr_sub(i,j,m,n) = (Ucontr_q(1,1) + Ucontr_q(2,2)) + (Ucontr_q(1,2)+Ucontr_q(2,1))
+    Vcontr_sub(i,j,m,n) = (Vcontr_q(1,1) + Vcontr_q(2,2)) + (Vcontr_q(1,2)+Vcontr_q(2,1))
   enddo; enddo ; enddo ; enddo
 
   !sum up the sub-cell contributions to each node
@@ -2866,11 +3024,11 @@ subroutine sum_square_matrix(sum_out, mat_in, n)
   integer, intent(in) :: n !< The length and width of each matrix in mat_in
   real, dimension(n,n), intent(in) :: mat_in !< The n x n matrix whose elements will be summed
   real, intent(out) :: sum_out !< The sum of the elements of matrix mat_in
-  integer :: s0,e0,s1,e1
+  integer :: s0, e0, s1, e1
 
-  sum_out=0.0
+  sum_out = 0.0
 
-  s0=1; e0=n
+  s0 = 1 ; e0 = n
 
   !start by summing elements on outer edges of matrix
   do while (s0<e0)
@@ -2878,7 +3036,7 @@ subroutine sum_square_matrix(sum_out, mat_in, n)
     !corners
     sum_out = sum_out + ( (mat_in(s0,s0) + mat_in(e0,e0)) + (mat_in(e0,s0) + mat_in(s0,e0)) )
 
-    s1=s0+1; e1=e0-1
+    s1 = s0+1 ; e1 = e0-1
 
     do while (s1<e1) !non-corners
 
@@ -2886,13 +3044,13 @@ subroutine sum_square_matrix(sum_out, mat_in, n)
                 ( ( (mat_in(s0,s1) + mat_in(s1,s0)) + (mat_in(e0,e1) + mat_in(e1,e0)) ) + &
                   ( (mat_in(e1,s0) + mat_in(e0,s1)) + (mat_in(s1,e0) + mat_in(s0,e1)) ) )
 
-      s1=s1+1 ; e1=e1-1
+      s1 = s1+1 ; e1 = e1-1
     enddo
 
     !center element of an edge
     if (s1==e1) sum_out = sum_out + ( (mat_in(s1,s0) + mat_in(e1,e0)) + (mat_in(e0,e1) + mat_in(s0,s1)) )
 
-    s0=s0+1 ; e0=e0-1 !next loop iteration using new edges that are one element inward of the current edges
+    s0 = s0+1 ; e0 = e0-1 !next loop iteration using new edges that are one element inward of the current edges
   enddo
 
   !center element of entire matrix
@@ -2941,10 +3099,15 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
   real :: ux, uy, vx, vy ! Interpolated weight gradients [L-1 ~> m-1]
   real :: uq, vq
+  real :: jac_wt  ! Per-quadrature-point metric correction |J_q|/areaT [nondim]
+  real :: strx_n, stry_n, strsh_n  ! Newton viscosity strain rates [T-1 ~> s-1]
+  real :: dstrain_diag_u, dstrain_diag_v  ! Newton viscosity diagonal correction factors [T-1 L-1 ~> s-1 m-1]
+  real :: phi_m_sq  ! Squared basis function value at quadrature point [nondim]
   real, dimension(2)   :: xquad
   real, dimension(2,2) :: Hcell, sub_ground
   real, dimension(2,2,4) :: u_diag_qp, v_diag_qp
   real, dimension(SZDIB_(G),SZDJB_(G),4) :: u_diag_b, v_diag_b
+  logical :: do_newton_visc  ! Whether to apply viscosity-related Newton tangent stiffness corrections
   logical :: visc_qp4
   integer :: i, j, isc, jsc, iec, jec, iphi, jphi, iq, jq, ilq, jlq, Itgt, Jtgt, qp, qpv
 
@@ -2959,6 +3122,8 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
     qpv = 1
   endif
 
+  do_newton_visc = CS%doing_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
+
   u_diag_b(:,:,:)=0.0
   v_diag_b(:,:,:)=0.0
 
@@ -2967,17 +3132,29 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
     ! Phi(2*i-1,j) gives d(Phi_i)/dx at quadrature point j
     ! Phi(2*i,j) gives d(Phi_i)/dy at quadrature point j
 
-    u_diag_qp(:,:,:)=0.0; v_diag_qp(:,:,:)=0.0
+    u_diag_qp(:,:,:) = 0.0 ; v_diag_qp(:,:,:) = 0.0
 
     do iq=1,2 ; do jq=1,2
 
       qp = 2*(jq-1)+iq !current quad point
       if (visc_qp4) qpv = qp !current quad point for viscosity
 
+      ! Ratio |J_q|/areaT corrects the uniform-area weight baked into ice_visc for
+      ! non-rectangular elements where opposite cell edges have unequal lengths.
+      jac_wt = CS%Jac(qp,i,j) * G%IareaT(i,j)
+
+      ! Pre-compute Newton strain data for this QP (for viscosity diagonal correction)
+      if (do_newton_visc) then
+        strx_n = CS%newton_str_ux(i,j,qpv)
+        stry_n = CS%newton_str_vy(i,j,qpv)
+        strsh_n = CS%newton_str_sh(i,j,qpv)
+      endif
+
       do jphi=1,2 ; Jtgt = J-2+jphi ; do iphi=1,2 ; Itgt = I-2+iphi
 
         ilq = 1 ; if (iq == iphi) ilq = 2
         jlq = 1 ; if (jq == jphi) jlq = 2
+        phi_m_sq = (xquad(ilq) * xquad(jlq))**2
 
         if (CS%umask(Itgt,Jtgt) == 1) then
 
@@ -2986,14 +3163,28 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
           vx = 0.
           vy = 0.
 
-          u_diag_qp(iphi,jphi,qp) = &
+          u_diag_qp(iphi,jphi,qp) = jac_wt * &
             ice_visc(i,j,qpv) * (((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)) + &
             ((uy+vx) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
+
+          ! Newton viscosity diagonal correction: newton_visc_factor * (g . grad_phi_m_u)^2
+          ! where grad_phi_m_u = [(2*strx+stry)*Phi_xm + strsh/2*Phi_ym] for u-DOF at node m
+          if (do_newton_visc) then
+            dstrain_diag_u = (2.*strx_n + stry_n) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
+                             strsh_n * 0.5 * Phi(2*(2*(jphi-1)+iphi),qp,i,j)
+            u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + &
+              jac_wt * CS%newton_visc_factor(i,j,qpv) * dstrain_diag_u**2
+          endif
 
           if (float_cond(i,j) == 0) then
             uq = xquad(ilq) * xquad(jlq)
             u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + &
-              (basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq))
+              jac_wt * (basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq))
+            ! Newton basal drag diagonal correction: newton_drag_coef * (umid_i)^2 * phi_m^2
+            if (CS%doing_newton) then
+              u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + &
+                jac_wt * CS%newton_drag_coef(i,j) * CS%newton_umid(i,j)**2 * phi_m_sq
+            endif
           endif
         endif
 
@@ -3004,14 +3195,27 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
           ux = 0.
           uy = 0.
 
-          v_diag_qp(iphi,jphi,qp) = &
+          v_diag_qp(iphi,jphi,qp) = jac_wt *  &
             ice_visc(i,j,qpv) * (((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)) + &
             ((4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
+
+          ! Newton viscosity diagonal correction for v-DOF: uses [strsh/2*Phi_xm + (2*stry+strx)*Phi_ym]
+          if (do_newton_visc) then
+            dstrain_diag_v = strsh_n * 0.5 * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
+                             (2.*stry_n + strx_n) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)
+            v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + &
+              jac_wt * CS%newton_visc_factor(i,j,qpv) * dstrain_diag_v**2
+          endif
 
           if (float_cond(i,j) == 0) then
             vq = xquad(ilq) * xquad(jlq)
             v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + &
-              (basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq))
+              jac_wt * (basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq))
+            ! Newton basal drag diagonal correction: newton_drag_coef * (vmid_i)^2 * phi_m^2
+            if (CS%doing_newton) then
+              v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + &
+                jac_wt * CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j)**2 * phi_m_sq
+            endif
           endif
         endif
       enddo ; enddo
@@ -3035,7 +3239,8 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
     if (float_cond(i,j) == 1) then
       Hcell(:,:) = H_node(i-1:i,j-1:j)
-      call CG_diagonal_subgrid_basal(Phisub, Hcell, CS%bed_elev(i,j), dens_ratio, sub_ground)
+      call CG_diagonal_subgrid_basal(Phisub, Hcell, CS%bed_elev(i,j), dens_ratio, sub_ground, &
+                                      G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j))
 
         if (CS%umask(I-1,J-1) == 1) u_diag_b(I-1,J-1,4) = u_diag_b(I-1,J-1,4) + (sub_ground(1,1) * basal_trac(i,j))
         if (CS%umask(I-1,J  ) == 1) u_diag_b(I-1,J  ,2) = u_diag_b(I-1,J  ,2) + (sub_ground(1,2) * basal_trac(i,j))
@@ -3046,6 +3251,28 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
         if (CS%vmask(I-1,J  ) == 1) v_diag_b(I-1,J  ,2) = v_diag_b(I-1,J  ,2) + (sub_ground(1,2) * basal_trac(i,j))
         if (CS%vmask(I  ,J-1) == 1) v_diag_b(I  ,J-1,3) = v_diag_b(I  ,J-1,3) + (sub_ground(2,1) * basal_trac(i,j))
         if (CS%vmask(I  ,J  ) == 1) v_diag_b(I  ,J  ,1) = v_diag_b(I  ,J  ,1) + (sub_ground(2,2) * basal_trac(i,j))
+
+        ! Newton basal drag diagonal correction for subgrid grounding line cells.
+        ! sub_ground(m,n) = sum over grounded sub-QPs of phi_{m,n}^2 * weight, computed by
+        ! CG_diagonal_subgrid_basal. Newton diagonal = newton_drag_coef * umid^2 * sub_ground (for u-block).
+        if (CS%doing_newton) then
+          if (CS%umask(I-1,J-1)==1) u_diag_b(I-1,J-1,4) = u_diag_b(I-1,J-1,4) + &
+            CS%newton_drag_coef(i,j) * CS%newton_umid(i,j)**2 * sub_ground(1,1)
+          if (CS%umask(I-1,J  )==1) u_diag_b(I-1,J  ,2) = u_diag_b(I-1,J  ,2) + &
+            CS%newton_drag_coef(i,j) * CS%newton_umid(i,j)**2 * sub_ground(1,2)
+          if (CS%umask(I  ,J-1)==1) u_diag_b(I  ,J-1,3) = u_diag_b(I  ,J-1,3) + &
+            CS%newton_drag_coef(i,j) * CS%newton_umid(i,j)**2 * sub_ground(2,1)
+          if (CS%umask(I  ,J  )==1) u_diag_b(I  ,J  ,1) = u_diag_b(I  ,J  ,1) + &
+            CS%newton_drag_coef(i,j) * CS%newton_umid(i,j)**2 * sub_ground(2,2)
+          if (CS%vmask(I-1,J-1)==1) v_diag_b(I-1,J-1,4) = v_diag_b(I-1,J-1,4) + &
+            CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j)**2 * sub_ground(1,1)
+          if (CS%vmask(I-1,J  )==1) v_diag_b(I-1,J  ,2) = v_diag_b(I-1,J  ,2) + &
+            CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j)**2 * sub_ground(1,2)
+          if (CS%vmask(I  ,J-1)==1) v_diag_b(I  ,J-1,3) = v_diag_b(I  ,J-1,3) + &
+            CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j)**2 * sub_ground(2,1)
+          if (CS%vmask(I  ,J  )==1) v_diag_b(I  ,J  ,1) = v_diag_b(I  ,J  ,1) + &
+            CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j)**2 * sub_ground(2,2)
+        endif
     endif
   endif ; enddo ; enddo
 
@@ -3056,7 +3283,8 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
 end subroutine matrix_diagonal
 
-subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, f_grnd)
+subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, f_grnd, &
+                                       dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT)
   real, dimension(:,:,:,:,:,:), &
                         intent(in) :: Phisub !< Quadrature structure weights at subgridscale
                                              !! locations for finite element calculations [nondim]
@@ -3067,32 +3295,49 @@ subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, f_grnd
                                                  !! of seawater [nondim]
   real, dimension(2,2), intent(out) :: f_grnd !< The weighted fraction of the sub-cell where the ice shelf
                                               !! is grounded [nondim]
+  real,                 intent(in)    :: dxCv_S !< The cell width at the southern (v-point) edge [L ~> m]
+  real,                 intent(in)    :: dxCv_N !< The cell width at the northern (v-point) edge [L ~> m]
+  real,                 intent(in)    :: dyCu_W !< The cell height at the western (u-point) edge [L ~> m]
+  real,                 intent(in)    :: dyCu_E !< The cell height at the eastern (u-point) edge [L ~> m]
+  real,                 intent(in)    :: IareaT !< The inverse of the cell area at the tracer point [L-2 ~> m-2]
 
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: f_grnd_sub ! The contributions to nodal f_grnd
                                                                    !! from each sub-cell
   integer, dimension(2,2,SIZE(Phisub,3),SIZE(Phisub,3)) :: grnd_stat !0 at floating quad points, 1 at grounded
   real, dimension(2,2) :: f_grnd_q  !Contributions to a node from each quadrature point in a sub-grid cell
-  real    :: subarea ! The fractional sub-cell area [nondim]
-  real    :: hloc    ! The local sub-region thickness [Z ~> m]
+  real    :: jac_sub_wt ! Per-sub-cell-QP metric correction |J_sub|/areaT [nondim]
+  real    :: a, d      ! Interpolated cell-edge spacings at the sub-cell QP [L ~> m]
+  real    :: subarea   ! The fractional sub-cell area in reference space [nondim]
+  real    :: hloc      ! The local sub-region thickness [Z ~> m]
   integer :: nsub, i, j, qx, qy, m, n
 
   nsub = size(Phisub,3)
-  subarea = 1.0 / (nsub**2)
+  subarea = 1.0 / real(nsub)**2
 
   grnd_stat(:,:,:,:)=0
 
-  do j=1,nsub ; do i=1,nsub;  do qy=1,2 ; do qx=1,2
+  do j=1,nsub ; do i=1,nsub ; do qy=1,2 ; do qx=1,2
     hloc = ((Phisub(qx,qy,i,j,1,1)*H_node(1,1)) + (Phisub(qx,qy,i,j,2,2)*H_node(2,2))) + &
            ((Phisub(qx,qy,i,j,1,2)*H_node(1,2)) + (Phisub(qx,qy,i,j,2,1)*H_node(2,1)))
     if (dens_ratio * hloc - bathyT > 0) grnd_stat(qx,qy,i,j) = 1
-  enddo; enddo ; enddo ; enddo
+  enddo ; enddo ; enddo ; enddo
 
   do n=1,2 ; do m=1,2 ; do j=1,nsub ; do i=1,nsub
     do qy=1,2 ; do qx = 1,2
-        f_grnd_q(qx,qy) = grnd_stat(qx,qy,i,j) * Phisub(qx,qy,i,j,m,n)**2
+      ! Interpolate cell-edge metrics to the sub-cell QP using the bilinear shape function values
+      ! from bilinear_shape_functions_subgrid.  Marginal sums of Phisub give the interpolation
+      ! weights: sum over k=1 nodes gives (1-y); k=2 gives y; l=1 gives (1-x); l=2 gives x.
+      ! This is analogous to jac_wt = CS%Jac(qp,i,j) * G%IareaT(i,j) in the regular routines.
+      a = dxCv_S * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1)) + &  ! (1-y) * dxCv_S
+          dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2))        ! + y * dxCv_N
+      d = dyCu_W * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2)) + &  ! (1-x) * dyCu_W
+          dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2))        ! + x * dyCu_E
+      jac_sub_wt = 0.25 * subarea * (a * d) * IareaT
+
+      f_grnd_q(qx,qy) = jac_sub_wt * grnd_stat(qx,qy,i,j) * Phisub(qx,qy,i,j,m,n)**2
     enddo ; enddo
     !calculate sub-cell contribution to each node by summing up quadrature point contributions from the sub-cell
-    f_grnd_sub(i,j,m,n) = (subarea * 0.25) * ((f_grnd_q(1,1) + f_grnd_q(2,2)) + (f_grnd_q(1,2)+f_grnd_q(2,1)))
+    f_grnd_sub(i,j,m,n) = (f_grnd_q(1,1) + f_grnd_q(2,2)) + (f_grnd_q(1,2)+f_grnd_q(2,1))
   enddo ; enddo ; enddo ; enddo
 
   !sum up the sub-cell contributions to each node
@@ -3127,14 +3372,14 @@ subroutine IS_dynamics_post_data_2(CS, ISS, G)
     allocate(CS%PhiC(1:8,G%isc:G%iec,G%jsc:G%jec), source=0.0)
     do j=G%jsc,G%jec ; do i=G%isc,G%iec
       call bilinear_shape_fn_grid_1qp(G, i, j, CS%PhiC(:,i,j))
-    enddo; enddo
+    enddo ; enddo
   endif
 
   !Calculate flux divergence and its components
   if (CS%id_duHdx > 0 .or. CS%id_dvHdy > 0 .or. CS%id_fluxdiv > 0) then
     call interpolate_H_to_B(G, ISS%h_shelf, ISS%hmask, H_node, CS%min_h_shelf)
 
-    Hu(:,:) = 0.0; Hv(:,:) = 0.0; Hux(:,:) = 0.0 ; Hvy(:,:) = 0.0 ; flux_div(:,:) = 0.0
+    Hu(:,:) = 0.0 ; Hv(:,:) = 0.0 ; Hux(:,:) = 0.0 ; Hvy(:,:) = 0.0 ; flux_div(:,:) = 0.0
     do J=G%jscB,G%jecB ; do I=G%iscB,G%iecB
       if (CS%umask(I,J) > 0) then
         Hu(I,J) = (H_node(I,J) * CS%u_shelf(I,J))
@@ -3142,7 +3387,7 @@ subroutine IS_dynamics_post_data_2(CS, ISS, G)
       if (CS%vmask(I,J) > 0) then
         Hv(I,J) = (H_node(I,J) * CS%v_shelf(I,J))
       endif
-    enddo; enddo
+    enddo ; enddo
 
     do j=G%jsc,G%jec ; do i=G%isc,G%iec
       if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 3)) then
@@ -3216,7 +3461,7 @@ subroutine IS_dynamics_post_data_2(CS, ISS, G)
             dev_stress(i,j,2) = 2*ice_visc(i,j)*strain_rate(i,j,2)/ISS%h_shelf(i,j) !deviatoric stress yy
             dev_stress(i,j,3) = 2*ice_visc(i,j)*strain_rate(i,j,3)/ISS%h_shelf(i,j) !deviatoric stress xy
           endif
-        enddo; enddo
+        enddo ; enddo
         if (CS%id_devstress_xx > 0) call post_data(CS%id_devstress_xx, dev_stress(:,:,1), CS%diag)
         if (CS%id_devstress_yy > 0) call post_data(CS%id_devstress_yy, dev_stress(:,:,2), CS%diag)
         if (CS%id_devstress_xy > 0) call post_data(CS%id_devstress_xy, dev_stress(:,:,3), CS%diag)
@@ -3229,7 +3474,7 @@ subroutine IS_dynamics_post_data_2(CS, ISS, G)
             p_dev_stress(i,j,1) = 2*ice_visc(i,j)*p_strain_rate(i,j,1)/ISS%h_shelf(i,j) !max horiz principal dev stress
             p_dev_stress(i,j,2) = 2*ice_visc(i,j)*p_strain_rate(i,j,2)/ISS%h_shelf(i,j) !min horiz principal dev stress
           endif
-        enddo; enddo
+        enddo ; enddo
         if (CS%id_pdevstress_1 > 0) call post_data(CS%id_pdevstress_1, p_dev_stress(:,:,1), CS%diag)
         if (CS%id_pdevstress_2 > 0) call post_data(CS%id_pdevstress_2, p_dev_stress(:,:,2), CS%diag)
       endif
@@ -3267,7 +3512,7 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   iegq = G%iegB ; jegq = G%jegB
   gisc = G%domain%nihalo+1 ; gjsc = G%domain%njhalo+1
   giec = G%domain%niglobal+gisc ; gjec = G%domain%njglobal+gjsc
-  is = iscq - 1; js = jscq - 1
+  is = iscq - 1 ; js = jscq - 1
 
   if (trim(CS%ice_viscosity_compute) == "MODEL") then
     if (CS%visc_qps==1) then
@@ -3279,7 +3524,7 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
     endif
   endif
 
-  n_g = CS%n_glen; eps_min = CS%eps_glen_min
+  n_g = CS%n_glen ; eps_min = CS%eps_glen_min
 
   do j=jsc,jec ; do i=isc,iec
 
@@ -3325,6 +3570,18 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
             max(0.5 * Visc_coef * &
             (US%s_to_T**2 * (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
             (US%Pa_to_RL2_T2*US%s_to_T),CS%min_ice_visc)  ! Rescale after the fractional power law.
+        ! Store Newton tangent stiffness data: strain rates and coefficient for Newton iterations.
+        ! The Newton correction coefficient is (1/n-1)/2 * ice_visc / eps_e2,
+        ! where eps_e2 = ux^2 + vy^2 + ux*vy + (uy+vx)^2/4 + eps_min^2 [T-2].
+        ! It is zero where ice_visc is limited by min_ice_visc (viscosity is not smooth there).
+        CS%newton_str_ux(i,j,1) = ux ; CS%newton_str_vy(i,j,1) = vy
+        CS%newton_str_sh(i,j,1) = uy + vx
+        CS%newton_visc_factor(i,j,1) = 0.0
+        if (CS%ice_visc(i,j,1) > CS%min_ice_visc * (G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf))) then
+          CS%newton_visc_factor(i,j,1) = (0.5*(1./n_g - 1.) / &
+              (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2)) * &
+              CS%ice_visc(i,j,1)
+        endif
       elseif (model_qp4) then
         !calculate viscosity at 4 quadrature points per cell
 
@@ -3356,7 +3613,17 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
               max(0.5 * Visc_coef * &
               (US%s_to_T**2*(((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
               (US%Pa_to_RL2_T2*US%s_to_T),CS%min_ice_visc)  ! Rescale after the fractional power law.
-        enddo; enddo
+          ! Store Newton tangent stiffness data at each quadrature point.
+          CS%newton_str_ux(i,j,2*(jq-1)+iq) = ux ; CS%newton_str_vy(i,j,2*(jq-1)+iq) = vy
+          CS%newton_str_sh(i,j,2*(jq-1)+iq) = uy + vx
+          CS%newton_visc_factor(i,j,2*(jq-1)+iq) = 0.0
+          if (CS%ice_visc(i,j,2*(jq-1)+iq) > &
+              CS%min_ice_visc * (G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf))) then
+            CS%newton_visc_factor(i,j,2*(jq-1)+iq) = (0.5*(1./n_g - 1.) / &
+                (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2)) * &
+                CS%ice_visc(i,j,2*(jq-1)+iq)
+          endif
+        enddo ; enddo
       endif
     endif
   enddo ; enddo
@@ -3389,6 +3656,8 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   real :: Hf !"floatation thickness" for Coulomb friction [Z ~> m]
   real :: fN ! Effective pressure (ice pressure - ocean pressure) for Coulomb friction [R Z L T-2 ~> Pa]
   real :: fB !for Coulomb Friction [(T L-1)^CS%CF_PostPeak ~> (s m-1)^CS%CF_PostPeak]
+  real :: fBuq ! fB * unorm^CF_PostPeak, for Coulomb Newton correction [nondim]
+  real :: unorm_code2 ! Squared velocity magnitude in code units [L2 T-2 ~> m2 s-2]
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
   iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
@@ -3396,7 +3665,7 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   iegq = G%iegB ; jegq = G%jegB
   gisc = G%domain%nihalo+1 ; gjsc = G%domain%njhalo+1
   giec = G%domain%niglobal+gisc ; gjec = G%domain%njglobal+gjsc
-  is = iscq - 1; js = jscq - 1
+  is = iscq - 1 ; js = jscq - 1
 
   eps_min = CS%eps_glen_min
 
@@ -3410,10 +3679,12 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
 
   do j=jsd+1,jed
     do i=isd+1,ied
+      CS%newton_drag_coef(i,j) = 0.0
       if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
         umid = ((u_shlf(I,J) + u_shlf(I-1,J-1)) + (u_shlf(I,J-1) + u_shlf(I-1,J))) * 0.25
         vmid = ((v_shlf(I,J) + v_shlf(I-1,J-1)) + (v_shlf(I,J-1) + v_shlf(I-1,J))) * 0.25
-        unorm = US%L_T_to_m_s * sqrt( ((umid**2) + (vmid**2)) + (eps_min**2 * (G%dxT(i,j)**2 + G%dyT(i,j)**2)) )
+        unorm_code2 = ((umid**2) + (vmid**2)) + (eps_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2)))
+        unorm = US%L_T_to_m_s * sqrt( unorm_code2 )
 
         !Coulomb friction (Schoof 2005, Gagliardini et al 2007)
         if (CS%CoulombFriction) then
@@ -3421,17 +3692,38 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
           Hf = max((CS%density_ocean_avg/CS%density_ice) * CS%bed_elev(i,j), 0.0)
           fN = max((US%L_to_Z*(CS%density_ice * CS%g_Earth) * (max(ISS%h_shelf(i,j),CS%min_h_shelf) - Hf)), CS%CF_MinN)
           fB = alpha * (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%CF_PostPeak/CS%n_basal_fric)
+          fBuq = fB * unorm**CS%CF_PostPeak
 
           CS%basal_traction(i,j) = ((G%areaT(i,j) * CS%C_basal_friction(i,j)) * &
-              (unorm**(CS%n_basal_fric-1.0) / (1.0 + fB * unorm**CS%CF_PostPeak)**(CS%n_basal_fric))) * &
+              (unorm**(CS%n_basal_fric-1.0) / (1.0 + fBuq)**(CS%n_basal_fric))) * &
               US%L_T_to_m_s   ! Restore the scaling after the fractional power law.
         else
           !linear (CS%n_basal_fric=1) or "Weertman"/power-law (CS%n_basal_fric /= 1)
+          fBuq = 0.0
           CS%basal_traction(i,j) = ((G%areaT(i,j) * CS%C_basal_friction(i,j)) * (unorm**(CS%n_basal_fric-1))) * &
                                    US%L_T_to_m_s ! Rescale after the fractional power law.
         endif
 
         CS%basal_traction(i,j)=max(CS%basal_traction(i,j), CS%min_basal_traction * G%areaT(i,j))
+
+        ! Store Newton basal drag data for Newton tangent stiffness correction.
+        ! newton_drag_coef = 2 * d(basal_trac)/d(|u|^2),
+        ! where d(tau_b_i)/d(u_j) = basal_trac*delta_ij + newton_drag_coef*u_i*u_j
+        ! This is the coefficient of the rank-1 correction u_i*(u.delta_u) to the Picard basal stiffness.
+        ! For Weertman: newton_drag_coef = (m-1) * basal_trac/|u|^2
+        ! For Coulomb:  newton_drag_coef = basal_trac/|u|^2 * [(m-1) - m*q*fB*|u|^q/(1+fB*|u|^q)]
+        CS%newton_umid(i,j) = umid
+        CS%newton_vmid(i,j) = vmid
+        ! unorm_code2: squared velocity magnitude in code units [L2 T-2], including regularization
+        ! (same expression as inside the sqrt in unorm, without US%L_T_to_m_s factor)
+        if (CS%CoulombFriction) then
+          CS%newton_drag_coef(i,j) = (1.0 / max(unorm_code2, epsilon(unorm_code2))) * &
+              CS%basal_traction(i,j) * ((CS%n_basal_fric - 1.) - &
+              CS%n_basal_fric * CS%CF_PostPeak * fBuq / (1. + fBuq))
+        else
+          CS%newton_drag_coef(i,j) = real(CS%n_basal_fric - 1.) * CS%basal_traction(i,j) / &
+              max(unorm_code2, epsilon(unorm_code2))
+        endif
       endif
     enddo
   enddo
@@ -3469,7 +3761,7 @@ subroutine update_OD_ffrac(CS, G, US, ocean_mass, find_avg)
       CS%ground_frac(i,j) = 1.0 - (CS%ground_frac_rt(i,j) * I_counter)
       CS%OD_av(i,j) = CS%OD_rt(i,j) * I_counter
 
-      CS%OD_rt(i,j) = 0.0 ; CS%ground_frac_rt(i,j) = 0.0; CS%OD_rt_counter = 0
+      CS%OD_rt(i,j) = 0.0 ; CS%ground_frac_rt(i,j) = 0.0 ; CS%OD_rt_counter = 0
     enddo ; enddo
 
     call pass_var(CS%ground_frac, G%domain, complete=.false.)
@@ -3526,7 +3818,7 @@ subroutine change_in_draft(CS, G, h_shelf0, h_shelf1, ddraft)
   do j=jsc,jec
     do i=isc,iec
 
-      b0=0.0; b1=0.0
+      b0 = 0.0 ; b1 = 0.0
 
       if (h_shelf0(i,j)>0.0) then
         OD = CS%bed_elev(i,j) - rhoi_rhow * h_shelf0(i,j)
@@ -3624,12 +3916,14 @@ end subroutine bilinear_shape_functions
 !> This subroutine calculates the gradients of bilinear basis elements that are centered at the
 !! vertices of the cell using a locally orthogoal MOM6 grid.  Values are calculated at
 !! points of gaussian quadrature.
-subroutine bilinear_shape_fn_grid(G, i, j, Phi)
+subroutine bilinear_shape_fn_grid(G, i, j, Phi, Jac)
   type(ocean_grid_type), intent(in)    :: G  !< The grid structure used by the ice shelf.
   integer,               intent(in)    :: i   !< The i-index in the grid to work on.
   integer,               intent(in)    :: j   !< The j-index in the grid to work on.
   real, dimension(8,4),  intent(inout) :: Phi !< The gradients of bilinear basis elements at Gaussian
                                               !! quadrature points surrounding the cell vertices [L-1 ~> m-1].
+  real, dimension(4), optional, intent(out) :: Jac !< Jacobian determinant |J_q| = a_q*d_q at each
+                                              !! Gaussian quadrature point [L2 ~> m2].
 
 ! This subroutine calculates the gradients of bilinear basis elements that
 ! that are centered at the vertices of the cell.  The values are calculated at
@@ -3683,6 +3977,7 @@ subroutine bilinear_shape_fn_grid(G, i, j, Phi)
       Phi(2*node,qpoint)   = ( (a * (2 * ynode - 3)) * xexp ) / (a*d)
 
     enddo
+    if (present(Jac)) Jac(qpoint) = a * d
   enddo
 
 end subroutine bilinear_shape_fn_grid
@@ -3823,12 +4118,12 @@ subroutine update_velocity_masks(CS, G, hmask, umask, vmask, u_face_mask, v_face
     is = isd+1 ; js = jsd+1
   endif
 
-  do j=js,G%jed; do i=is,G%ied
+  do j=js,G%jed ; do i=is,G%ied
     if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
       umask(I-1:I,J-1:J)=1
       vmask(I-1:I,J-1:J)=1
     endif
-  enddo; enddo
+  enddo ; enddo
 
   do j=js,G%jed
     do i=is,G%ied
@@ -3963,7 +4258,7 @@ subroutine interpolate_H_to_B(G, h_shelf, hmask, H_node, min_h_shelf)
   do j=jsc-1,jec
     do i=isc-1,iec
       num_h = 0
-      do l=1,2; jc=j-1+l; do k=1,2; ic=i-1+k
+      do l=1,2 ; jc=j-1+l ; do k=1,2 ; ic=i-1+k
         if (hmask(ic,jc) == 1.0 .or. hmask(ic,jc) == 3.0) then
           h_arr(k,l)=max(h_shelf(ic,jc),min_h_shelf)
           num_h = num_h + 1
@@ -3973,7 +4268,7 @@ subroutine interpolate_H_to_B(G, h_shelf, hmask, H_node, min_h_shelf)
         if (num_h > 0) then
           H_node(i,j) = ((h_arr(1,1)+h_arr(2,2))+(h_arr(1,2)+h_arr(2,1))) / num_h
         endif
-      enddo; enddo
+      enddo ; enddo
     enddo
   enddo
 
@@ -3989,19 +4284,28 @@ subroutine ice_shelf_dyn_end(CS)
 
   deallocate(CS%u_shelf, CS%v_shelf)
   deallocate(CS%taudx_shelf, CS%taudy_shelf)
+  deallocate(CS%sx_shelf, CS%sy_shelf)
   deallocate(CS%t_shelf, CS%tmask)
   deallocate(CS%u_bdry_val, CS%v_bdry_val)
   deallocate(CS%u_face_mask, CS%v_face_mask)
+  deallocate(CS%u_flux_bdry_val, CS%v_flux_bdry_val)
   deallocate(CS%umask, CS%vmask)
   deallocate(CS%u_face_mask_bdry, CS%v_face_mask_bdry)
   deallocate(CS%h_bdry_val)
   deallocate(CS%float_cond)
+  if (associated(CS%calve_mask)) deallocate(CS%calve_mask)
 
   deallocate(CS%ice_visc, CS%AGlen_visc)
+  deallocate(CS%newton_visc_factor, CS%newton_str_ux, CS%newton_str_vy, CS%newton_str_sh)
+  deallocate(CS%newton_umid, CS%newton_vmid, CS%newton_drag_coef)
   deallocate(CS%basal_traction,CS%C_basal_friction)
   deallocate(CS%OD_rt, CS%OD_av)
   deallocate(CS%t_bdry_val, CS%bed_elev)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
+  if (associated(CS%Jac)) deallocate(CS%Jac)
+  if (associated(CS%Phi)) deallocate(CS%Phi)
+  if (associated(CS%Phisub)) deallocate(CS%Phisub)
+  if (associated(CS%PhiC)) deallocate(CS%PhiC)
 
   deallocate(CS)
 
