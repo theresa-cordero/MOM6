@@ -96,6 +96,7 @@ type, public :: Kappa_shear_CS ; private
                              !! when using the geometric mean with VERTEX_SHEAR=True.  The model
                              !! is sensitive to this value, which is a drawback of using the
                              !! geometric average as currently implemented.
+  real    :: kappa_shear_cap !< A dimensional cap on kappa shear
   logical :: psurf_bug       !< If true, do a simple average of the cell surface pressures to get a
                              !! surface pressure at the corner if VERTEX_SHEAR=True.  Otherwise mask
                              !! out any land points in the average.
@@ -197,6 +198,7 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
     N2_mean, &  ! The time-weighted average of N2 [T-2 ~> s-2].
     S2_mean     ! The time-weighted average of S2 [T-2 ~> s-2].
 
+  real :: kappa_cap     ! 
   real :: f2    ! The squared Coriolis parameter of each column [T-2 ~> s-2].
   real :: surface_pres  ! The top surface pressure [R L2 T-2 ~> Pa].
 
@@ -212,6 +214,9 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
   real, dimension(SZK_(GV)+1) :: kf ! The fractional weight of interface kc+1 for
                         ! interpolating back to the original index space [nondim].
   integer :: is, ie, js, je, i, j, k, nz, nzc
+
+  !!! TJC !!!
+  kappa_cap = CS%kappa_shear_cap
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
 
@@ -333,7 +338,11 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
     ! Extrapolate from the vertically reduced grid back to the original layers.
       if (nz == nzc) then
         do K=1,nz+1
-          kappa_2d(i,K) = kappa_avg(K)
+          if (kappa_cap > 0) then
+            kappa_2d(i,K) = MIN(kappa_avg(K), kappa_cap)
+          else
+            kappa_2d(i,K) = kappa_avg(K)
+          endif
           if (CS%all_layer_TKE_bug) then
             tke_2d(i,K) = tke(K)
           else
@@ -354,6 +363,11 @@ subroutine Calculate_kappa_shear(u_in, v_in, h, tv, p_surf, kappa_io, tke_io, &
         enddo ; endif
       else
         do K=1,nz+1
+          if (kappa_cap > 0) then
+            kappa_avg(kc(K)) = MIN(kappa_avg(kc(K)), kappa_cap)
+          else
+            kappa_avg(kc(K)) = kappa_avg(kc(K))
+          endif
           if (kf(K) == 0.0) then
             kappa_2d(i,K) = kappa_avg(kc(K))
             tke_2d(i,K) = tke_avg(kc(K))
@@ -1000,6 +1014,7 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
                            ! the resolution is 1/2^dt_refinements.
   integer :: k, itt, itt_dt
 
+
   ! This calculation of N2 is for debugging only.
   ! real, dimension(SZK_(GV)+1) :: &
   !   N2_debug, & ! A version of N2 for debugging [T-2 ~> s-2]
@@ -1226,6 +1241,9 @@ subroutine kappa_shear_column(kappa, tke, dt, nzc, f2, surface_pres, hlay, dz_la
       enddo
 
       do itt_dt=1,(CS%max_KS_it+1-itt)/2
+        !do k=ks_kappa,ke_kappa ;
+        !  kappa_out(k) = MIN(kappa_out(k), kappa_cap)
+        !enddo
         !   The maximum number of times that the time-step is halved in
         ! seeking an acceptable timestep is reduced with each iteration,
         ! so that as the maximum number of iterations is approached, the
@@ -2216,6 +2234,10 @@ function kappa_shear_init(Time, G, GV, US, param_file, diag, CS)
                  "This adjustment is to account for regions where 3 dimensional turbulence "//&
                  "prevents the growth of shear instabilities [nondim].", &
                  units="nondim", default=1.0)
+  call get_param(param_file, mdl, "KAPPA_SHEAR_CAP", CS%kappa_shear_cap, &
+                 "A cap on the diffusivity from shear mixing applied AFTER all the itteraions "//&
+                 "in the shear mixing paramerterization. If negative, it will not be used.", &
+                 units="m2 s-1", default=-1.0, scale=US%m_to_Z**2*US%T_to_s)
   call get_param(param_file, mdl, "KAPPA_SHEAR_TOL_ERR", CS%kappa_tol_err, &
                  "The fractional error in kappa that is tolerated. "//&
                  "Iteration stops when changes between subsequent "//&
