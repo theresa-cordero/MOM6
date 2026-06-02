@@ -508,6 +508,7 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     N2_mean, &  ! The time-weighted average of N2 [T-2 ~> s-2].
     S2_mean     ! The time-weighted average of S2 [T-2 ~> s-2].
 
+  real :: kappa_cap     ! 
   real :: f2    ! The squared Coriolis parameter of each column [T-2 ~> s-2].
   real :: surface_pres  ! The top surface pressure [R L2 T-2 ~> Pa].
 
@@ -548,6 +549,8 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
   dz_massless = 0.1*sqrt((US%Z_to_m*GV%m_to_H)*k0dt)
   I_Prandtl = 0.0 ; if (CS%Prandtl_turb > 0.0) I_Prandtl = 1.0 / CS%Prandtl_turb
   H_tiny = 0.5 * GV%H_subroundoff
+
+  kappa_cap = CS%kappa_shear_cap
 
   ! Convert layer thicknesses into geometric thickness in height units.
   call thickness_to_dz(h, tv, dz_3d, G, GV, US, halo_size=1)
@@ -720,7 +723,11 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
     ! Extrapolate from the vertically reduced grid back to the original layers.
       if (nz == nzc) then
         do K=1,nz+1
-          kappa_2d(I,K) = kappa_avg(K)
+          if (kappa_cap > 0) then
+            kappa_2d(i,K) = MIN(kappa_avg(K), kappa_cap)
+          else
+            kappa_2d(i,K) = kappa_avg(K)
+          endif
           if (CS%all_layer_TKE_bug) then
             tke_2d(I,K) = tke(K)
           else
@@ -741,6 +748,11 @@ subroutine Calc_kappa_shear_vertex(u_in, v_in, h, T_in, S_in, tv, p_surf, kappa_
         enddo ; endif
       else
         do K=1,nz+1
+          if (kappa_cap > 0) then
+            kappa_avg(kc(K)) = MIN(kappa_avg(kc(K)), kappa_cap)
+          else
+            kappa_avg(kc(K)) = kappa_avg(kc(K))
+          endif
           if (kf(K) == 0.0) then
             kappa_2d(I,K) = kappa_avg(kc(K))
             tke_2d(I,K) = tke_avg(kc(K))
